@@ -1,15 +1,16 @@
 """
-Automated Test Suite for Police Officer Account Provisioning.
+Automated Test Suite for Staff Portal Account Provisioning.
 Tests:
-1. SEED_OFFICER_USERNAMES creates one ACTIVE OFFICER row per username in users
-2. Passwords are stored with the existing PBKDF2-HMAC-SHA256 hash, never plaintext
-3. Re-running the seed never duplicates an account
-4. An already-provisioned officer is never overwritten
-5. Without SEED_OFFICER_PASSWORD nothing is created (no fallback password)
-6. Usernames are trimmed, lower-cased and de-duplicated
-7. Login resolves the officer by username or email and refuses other roles
-8. Officer identity (id, name, badge, role) is recorded in the session audit trail
-9. Existing admin and citizen accounts keep working after provisioning
+1. One username can serve the Verification, Police and Main Authorized Officer portals
+2. Each portal gets its own role, id, email, badge and salt
+3. Passwords go through the existing PBKDF2-HMAC-SHA256 hash, never plaintext
+4. Re-running the seed on every boot creates no duplicates and rewrites nothing
+5. A username that already resolves for a role is left alone, even under an older
+   email scheme, and a blocked email is reported instead of raising
+6. Without SEED_OFFICER_PASSWORD nothing is created (no fallback password)
+7. Logins are role-scoped: each portal reaches its own account and no other
+8. An identifier matching several accounts is refused when no role is supplied
+9. Existing citizen and administrator accounts keep working untouched
 """
 
 import os
@@ -31,17 +32,25 @@ if PORTAL_DIR not in sys.path:
 from backend.services.auth_service import authenticate_user, register_user
 from backend.services.crypto_service import verify_password
 from backend.services.db import get_db_connection, init_database
-from backend.services.staff_accounts import ensure_seed_officer_accounts
+from backend.services.staff_accounts import ensure_seed_staff_accounts
 from backend.services.verification_service import create_officer_session
 
-SEED_USERNAMES = 'person1,person2,person3'
 # A fixture password only: these tests run against a throwaway database, so no
 # real account credential ever appears here.
-SEED_PASSWORD = 'seed-fixture-password'
-SEED_KEYS = ('SEED_OFFICER_USERNAMES', 'SEED_OFFICER_PASSWORD', 'SEED_OFFICER_EMAIL_DOMAIN')
+SEED_PASSWORD = 'staff-seed-fixture'
+SHARED_USERNAME = 'Person 1'
+SEED_ENV_KEYS = (
+    'SEED_OFFICER_USERNAMES',
+    'SEED_VERIFICATION_OFFICER_USERNAMES',
+    'SEED_POLICE_OFFICER_USERNAMES',
+    'SEED_MAIN_AUTHORIZED_OFFICER_USERNAMES',
+    'SEED_OFFICER_PASSWORD',
+    'SEED_OFFICER_EMAIL_DOMAIN',
+)
+PORTAL_ROLES = ('VERIFICATION_OFFICER', 'OFFICER', 'ADMIN')
 
 
-class StaffAccountSeedTests(unittest.TestCase):
+class StaffPortalSeedTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
@@ -50,12 +59,17 @@ class StaffAccountSeedTests(unittest.TestCase):
     def setUp(self):
         os.environ['FIR_DB_PATH'] = os.path.join(TEST_DB_DIRECTORY, f'staff_{self.id()}.db')
         init_database()
-        os.environ['SEED_OFFICER_USERNAMES'] = SEED_USERNAMES
+        self.clear_env()
+        os.environ['SEED_VERIFICATION_OFFICER_USERNAMES'] = SHARED_USERNAME
+        os.environ['SEED_POLICE_OFFICER_USERNAMES'] = SHARED_USERNAME
+        os.environ['SEED_MAIN_AUTHORIZED_OFFICER_USERNAMES'] = SHARED_USERNAME
         os.environ['SEED_OFFICER_PASSWORD'] = SEED_PASSWORD
-        os.environ.pop('SEED_OFFICER_EMAIL_DOMAIN', None)
 
     def tearDown(self):
-        for key in SEED_KEYS:
+        self.clear_env()
+
+    def clear_env(self):
+        for key in SEED_ENV_KEYS:
             os.environ.pop(key, None)
 
     # ── helpers ────────────────────────────────────────────────────────────
@@ -72,187 +86,246 @@ class StaffAccountSeedTests(unittest.TestCase):
         finally:
             conn.close()
 
-    # ── 1. provisioning ────────────────────────────────────────────────────
-    def test_three_officer_accounts_are_created(self):
-        outcome = ensure_seed_officer_accounts()
-        self.assertEqual(outcome['created'], ['person1', 'person2', 'person3'])
-
-        officers = self._users(role='OFFICER')
-        self.assertEqual(len(officers), 3)
-        self.assertEqual([o['badge_number'] for o in officers], ['person1', 'person2', 'person3'])
-        self.assertEqual({o['role'] for o in officers}, {'OFFICER'})
-        self.assertEqual({o['status'] for o in officers}, {'ACTIVE'})
-        self.assertEqual(len({o['id'] for o in officers}), 3, 'each account needs a unique user id')
-        self.assertEqual(len({o['email'] for o in officers}), 3)
-        for officer in officers:
-            self.assertTrue(officer['name'].startswith('Officer '), officer['name'])
-
-    def test_custom_email_domain_is_used(self):
-        os.environ['SEED_OFFICER_EMAIL_DOMAIN'] = 'police.example'
-        ensure_seed_officer_accounts()
-        officers = self._users(role='OFFICER')
-        self.assertEqual([o['email'] for o in officers], [
-            'person1@police.example', 'person2@police.example', 'person3@police.example'
-        ])
-
-    # ── 2. password storage ────────────────────────────────────────────────
-    def test_passwords_are_hashed_and_salted(self):
-        ensure_seed_officer_accounts()
-        for officer in self._users(role='OFFICER'):
-            self.assertNotEqual(officer['password_hash'], SEED_PASSWORD)
-            self.assertNotIn(SEED_PASSWORD, officer['password_hash'])
-            self.assertNotIn(SEED_PASSWORD, officer['salt'])
-            self.assertEqual(len(officer['password_hash']), 64)
-            self.assertEqual(len(officer['salt']), 64)
-            self.assertTrue(verify_password(SEED_PASSWORD, officer['password_hash'], officer['salt']))
-            self.assertFalse(verify_password('wrong', officer['password_hash'], officer['salt']))
-
-        officers = self._users(role='OFFICER')
-        self.assertEqual(len({o['salt'] for o in officers}), 3, 'each account gets its own salt')
-
-    # ── 3. idempotency ─────────────────────────────────────────────────────
-    def test_rerunning_the_seed_creates_no_duplicates(self):
-        first = ensure_seed_officer_accounts()
-        hashes_before = {o['badge_number']: o['password_hash'] for o in self._users(role='OFFICER')}
-
-        second = ensure_seed_officer_accounts()
-        third = ensure_seed_officer_accounts()
-
-        self.assertEqual(first['created'], ['person1', 'person2', 'person3'])
-        self.assertEqual(second['created'], [])
-        self.assertEqual(sorted(second['existing']), ['person1', 'person2', 'person3'])
-        self.assertEqual(third['created'], [])
-        self.assertEqual(len(self._users(role='OFFICER')), 3)
-        self.assertEqual(
-            hashes_before,
-            {o['badge_number']: o['password_hash'] for o in self._users(role='OFFICER')},
-            'a repeated seed must not re-hash or replace an account'
-        )
-
-    def test_existing_officer_is_not_overwritten(self):
-        register_user(
-            name='Existing Investigator',
-            email='person1@other.station',
-            phone='9000000001',
-            password='already-in-place',
-            role='OFFICER',
-            badge_number='person1',
-        )
-        outcome = ensure_seed_officer_accounts()
-
-        officers = self._users(role='OFFICER')
-        self.assertEqual(len(officers), 3, 'the pre-existing badge number is reused, not duplicated')
-        self.assertIn('person1', outcome['existing'])
-        original = [o for o in officers if o['badge_number'] == 'person1'][0]
-        self.assertEqual(original['name'], 'Existing Investigator')
-        self.assertTrue(verify_password('already-in-place', original['password_hash'], original['salt']))
-        self.assertIsNone(authenticate_user('person1', SEED_PASSWORD, required_role='OFFICER'))
-
-    def test_without_a_password_nothing_is_created(self):
-        os.environ.pop('SEED_OFFICER_PASSWORD')
-        outcome = ensure_seed_officer_accounts()
-        self.assertEqual(outcome['created'], [])
-        self.assertEqual(outcome['skipped'], ['person1', 'person2', 'person3'])
-        self.assertEqual(self._users(role='OFFICER'), [])
-
-    def test_without_usernames_nothing_happens(self):
-        os.environ['SEED_OFFICER_USERNAMES'] = '  '
-        outcome = ensure_seed_officer_accounts()
-        self.assertEqual(outcome, {'created': [], 'existing': [], 'skipped': []})
-        self.assertEqual(self._users(), [])
-
-    def test_usernames_are_normalised_and_deduplicated(self):
-        os.environ['SEED_OFFICER_USERNAMES'] = ' Person1 , person1 ,,PERSON1 , person2 '
-        ensure_seed_officer_accounts()
-        officers = self._users(role='OFFICER')
-        self.assertEqual([o['badge_number'] for o in officers], ['person1', 'person2'])
-
-    # ── 4. authentication ──────────────────────────────────────────────────
-    def test_login_by_username_and_email(self):
-        ensure_seed_officer_accounts()
-        for username in ('person1', 'person2', 'person3'):
-            user = authenticate_user(username, SEED_PASSWORD, required_role='OFFICER')
-            self.assertIsNotNone(user, username)
-            self.assertEqual(user['badge_number'], username)
-            self.assertEqual(user['role'], 'OFFICER')
-            self.assertNotIn('password_hash', user)
-            self.assertNotIn('salt', user)
-            self.assertIsNotNone(
-                authenticate_user(f'{username}@eksp.gov.in', SEED_PASSWORD, required_role='OFFICER')
-            )
-            self.assertIsNotNone(authenticate_user(username.upper(), SEED_PASSWORD, required_role='OFFICER'))
-
-    def test_wrong_password_is_refused(self):
-        ensure_seed_officer_accounts()
-        self.assertIsNone(authenticate_user('person1', 'person@2', required_role='OFFICER'))
-        self.assertIsNone(authenticate_user('person1', '', required_role='OFFICER'))
-        self.assertIsNone(authenticate_user('person4', SEED_PASSWORD, required_role='OFFICER'))
-
-    def test_officers_cannot_sign_in_to_other_roles(self):
-        ensure_seed_officer_accounts()
-        self.assertIsNone(authenticate_user('person1', SEED_PASSWORD, required_role='ADMIN'))
-        self.assertIsNone(authenticate_user('person1', SEED_PASSWORD, required_role='CITIZEN'))
-        self.assertIsNone(authenticate_user('person1', SEED_PASSWORD, required_role='VERIFICATION_OFFICER'))
-
-    def test_suspended_officer_cannot_sign_in(self):
-        ensure_seed_officer_accounts()
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET status = 'SUSPENDED' WHERE badge_number = 'person2'")
-        conn.commit()
-        conn.close()
-        self.assertIsNone(authenticate_user('person2', SEED_PASSWORD, required_role='OFFICER'))
-        self.assertIsNotNone(authenticate_user('person1', SEED_PASSWORD, required_role='OFFICER'))
-
-    # ── 5. session / audit identity ────────────────────────────────────────
-    def test_officer_session_and_audit_record_identity(self):
-        ensure_seed_officer_accounts()
-        officer = authenticate_user('person3', SEED_PASSWORD, required_role='OFFICER')
-        session = create_officer_session(officer_user=officer, location_name='Central Station')
-
+    def _snapshot(self):
         conn = get_db_connection()
         try:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM officer_sessions WHERE id = ?', (session['session_id'],))
-            row = dict(cursor.fetchone())
-            cursor.execute(
-                'SELECT * FROM system_audit_logs WHERE resource_id = ?', (session['session_id'],)
-            )
-            audit = dict(cursor.fetchone())
+            cursor.execute('SELECT * FROM users')
+            return {row['id']: dict(row) for row in cursor.fetchall()}
         finally:
             conn.close()
 
-        self.assertEqual(row['officer_id'], officer['id'])
-        self.assertEqual(row['officer_name'], officer['name'])
-        self.assertEqual(row['badge_number'], 'person3')
-        self.assertEqual(row['role'], 'OFFICER')
-        self.assertEqual(audit['user_id'], officer['id'])
-        self.assertEqual(audit['user_email'], officer['email'])
-        self.assertEqual(audit['action'], 'OFFICER_AUTHENTICATED_LOGIN')
-        self.assertIn('person3', audit['details'])
+    # ── 1. one username, three portals ─────────────────────────────────────
+    def test_shared_username_provisions_one_account_per_portal(self):
+        outcome = ensure_seed_staff_accounts()
 
-    # ── 6. other roles keep working ────────────────────────────────────────
-    def test_admin_and_citizen_logins_are_unaffected(self):
-        admin = register_user(
-            name='Site Admin', email='admin@eksp.gov.in', phone='admin@eksp.gov.in',
-            password='admin-pass', role='ADMIN', badge_number='KA-ADM-01',
+        self.assertEqual(sorted(outcome['created']), sorted([
+            f'VERIFICATION_OFFICER:{SHARED_USERNAME}',
+            f'OFFICER:{SHARED_USERNAME}',
+            f'ADMIN:{SHARED_USERNAME}',
+        ]))
+        staff = self._users()
+        self.assertEqual(len(staff), 3)
+        self.assertEqual({o['role'] for o in staff}, set(PORTAL_ROLES))
+        self.assertEqual({o['status'] for o in staff}, {'ACTIVE'})
+        self.assertEqual(len({o['id'] for o in staff}), 3, 'each account needs a unique user id')
+        self.assertEqual(len({o['email'] for o in staff}), 3, 'emails must stay unique')
+        self.assertEqual(len({o['badge_number'] for o in staff}), 3, 'badge numbers must stay unique')
+        self.assertEqual({o['name'] for o in staff}, {SHARED_USERNAME})
+        self.assertEqual(
+            {o['rank'] for o in staff},
+            {'Verification Officer', 'Police Officer', 'Main Authorized Officer'}
         )
-        citizen = register_user(
-            name='Approved Citizen', email='citizen@eksp.gov.in', phone='9876500001',
+
+    def test_three_portals_do_not_leak_into_a_fourth(self):
+        ensure_seed_staff_accounts()
+        officers = self._users(role='OFFICER')
+        self.assertEqual(len(officers), 1)
+        self.assertEqual(len(self._users(role='ADMIN')), 1)
+        self.assertEqual(len(self._users(role='VERIFICATION_OFFICER')), 1)
+
+    # ── 2. password storage ────────────────────────────────────────────────
+    def test_passwords_are_hashed_with_individual_salts(self):
+        ensure_seed_staff_accounts()
+        staff = self._users()
+        for account in staff:
+            self.assertNotEqual(account['password_hash'], SEED_PASSWORD)
+            self.assertNotIn(SEED_PASSWORD, account['password_hash'])
+            self.assertNotIn(SEED_PASSWORD, account['salt'])
+            self.assertEqual(len(account['password_hash']), 64)
+            self.assertEqual(len(account['salt']), 64)
+            self.assertTrue(verify_password(SEED_PASSWORD, account['password_hash'], account['salt']))
+            self.assertFalse(verify_password('wrong', account['password_hash'], account['salt']))
+        self.assertEqual(len({account['salt'] for account in staff}), 3, 'each account gets its own salt')
+
+    # ── 3. idempotency ─────────────────────────────────────────────────────
+    def test_rerunning_the_seed_creates_no_duplicates(self):
+        first = ensure_seed_staff_accounts()
+        before = self._snapshot()
+
+        second = ensure_seed_staff_accounts()
+        third = ensure_seed_staff_accounts()
+
+        self.assertEqual(len(first['created']), 3)
+        self.assertEqual(second['created'], [])
+        self.assertEqual(sorted(second['existing']), sorted(first['created']))
+        self.assertEqual(third['created'], [])
+        self.assertEqual(len(self._users()), 3)
+        self.assertEqual(before, self._snapshot(), 'a repeated seed must not rewrite any row')
+
+    def test_account_from_an_older_email_scheme_is_not_duplicated(self):
+        register_user(
+            name='Officer Person1', email='person1@eksp.gov.in', phone='9000000001',
+            password='already-in-place', role='OFFICER', badge_number='person-1-police',
+        )
+        os.environ['SEED_POLICE_OFFICER_USERNAMES'] = 'Officer Person1'
+
+        outcome = ensure_seed_staff_accounts()
+
+        self.assertIn("OFFICER:Officer Person1", outcome['existing'])
+        self.assertEqual(len(self._users(role='OFFICER')), 1)
+        self.assertEqual(len(self._users()), 3)
+
+    def test_taken_email_is_skipped_instead_of_raising(self):
+        register_user(
+            name='Existing Citizen', email='person-1-police@eksp.gov.in', phone='9876500002',
             password='citizen-pass', role='CITIZEN', status='ACTIVE',
         )
+        outcome = ensure_seed_staff_accounts()
 
-        ensure_seed_officer_accounts()
+        self.assertNotIn('OFFICER:Person 1', outcome['created'])
+        self.assertIn('OFFICER:Person 1', outcome['existing'])
+        self.assertEqual(len(self._users(role='OFFICER')), 0)
+        self.assertEqual(len(self._users()), 3)
 
-        signed_in_admin = authenticate_user('KA-ADM-01', 'admin-pass', required_role='ADMIN')
-        self.assertIsNotNone(signed_in_admin)
-        self.assertEqual(signed_in_admin['id'], admin['id'])
-        self.assertIsNotNone(authenticate_user('citizen@eksp.gov.in', 'citizen-pass', required_role='CITIZEN'))
+    def test_without_a_password_nothing_is_created(self):
+        os.environ.pop('SEED_OFFICER_PASSWORD')
+        outcome = ensure_seed_staff_accounts()
+        self.assertEqual(outcome['created'], [])
+        self.assertEqual(sorted(outcome['skipped']), sorted([
+            'VERIFICATION_OFFICER:Person 1', 'OFFICER:Person 1', 'ADMIN:Person 1'
+        ]))
+        self.assertEqual(self._users(), [])
 
-        roles = {user['id']: user['role'] for user in self._users()}
-        self.assertEqual(roles[admin['id']], 'ADMIN')
-        self.assertEqual(roles[citizen['id']], 'CITIZEN')
+    def test_without_usernames_nothing_happens(self):
+        for key in ('SEED_VERIFICATION_OFFICER_USERNAMES', 'SEED_POLICE_OFFICER_USERNAMES',
+                    'SEED_MAIN_AUTHORIZED_OFFICER_USERNAMES'):
+            os.environ[key] = '   '
+        outcome = ensure_seed_staff_accounts()
+        self.assertEqual(outcome, {'created': [], 'existing': [], 'skipped': []})
+        self.assertEqual(self._users(), [])
+
+    def test_legacy_police_officer_list_is_still_provisioned(self):
+        self.clear_env()
+        os.environ['SEED_OFFICER_USERNAMES'] = 'person2, Person 2 , person2'
+        os.environ['SEED_OFFICER_PASSWORD'] = SEED_PASSWORD
+
+        ensure_seed_staff_accounts()
+        second_run = ensure_seed_staff_accounts()
+
+        officers = self._users(role='OFFICER')
+        self.assertEqual([o['name'] for o in officers], ['Person 2', 'person2'])
+        self.assertEqual(second_run['created'], [])
+
+    # ── 4. authentication ──────────────────────────────────────────────────
+    def test_each_portal_authenticates_its_own_account(self):
+        ensure_seed_staff_accounts()
+        accounts = {account['role']: account for account in self._users()}
+
+        for role in PORTAL_ROLES:
+            signed_in = authenticate_user(SHARED_USERNAME, SEED_PASSWORD, required_role=role)
+            self.assertIsNotNone(signed_in, role)
+            self.assertEqual(signed_in['id'], accounts[role]['id'], role)
+            self.assertEqual(signed_in['role'], role)
+            self.assertNotIn('password_hash', signed_in)
+            self.assertNotIn('salt', signed_in)
+            # case-insensitive and space-tolerant, like every other staff login
+            self.assertEqual(
+                authenticate_user('  person 1 ', SEED_PASSWORD, required_role=role)['id'],
+                accounts[role]['id']
+            )
+
+    def test_wrong_password_is_refused_on_every_portal(self):
+        ensure_seed_staff_accounts()
+        for role in PORTAL_ROLES:
+            self.assertIsNone(authenticate_user(SHARED_USERNAME, 'wrong', required_role=role), role)
+            self.assertIsNone(authenticate_user(SHARED_USERNAME, '', required_role=role), role)
+
+    def test_no_portal_accepts_another_roles_account(self):
+        ensure_seed_staff_accounts()
+        accounts = {account['role']: account for account in self._users()}
+        for role in PORTAL_ROLES:
+            by_email = authenticate_user(accounts[role]['email'], SEED_PASSWORD,
+                                         required_role=role)
+            self.assertIsNotNone(by_email)
+            for other in PORTAL_ROLES:
+                if other == role:
+                    continue
+                self.assertIsNone(
+                    authenticate_user(accounts[role]['email'], SEED_PASSWORD, required_role=other),
+                    f"{role} account must not sign in as {other}"
+                )
+
+    def test_shared_username_without_a_role_is_refused(self):
+        ensure_seed_staff_accounts()
+        self.assertIsNone(authenticate_user(SHARED_USERNAME, SEED_PASSWORD))
+        self.assertIsNone(authenticate_user(SHARED_USERNAME, SEED_PASSWORD, required_role='CITIZEN'))
+
+    def test_badge_and_email_identifiers_stay_unambiguous(self):
+        ensure_seed_staff_accounts()
+        accounts = {account['role']: account for account in self._users()}
+        for role, account in accounts.items():
+            by_badge = authenticate_user(account['badge_number'], SEED_PASSWORD)
+            self.assertIsNotNone(by_badge, f"{role} badge resolves on its own")
+            self.assertEqual(by_badge['id'], account['id'])
+            self.assertEqual(by_badge['role'], role)
+
+    def test_suspended_account_cannot_sign_in(self):
+        ensure_seed_staff_accounts()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET status = 'SUSPENDED' WHERE role = 'ADMIN'")
+        conn.commit()
+        conn.close()
+        self.assertIsNone(authenticate_user(SHARED_USERNAME, SEED_PASSWORD, required_role='ADMIN'))
+        self.assertIsNotNone(
+            authenticate_user(SHARED_USERNAME, SEED_PASSWORD, required_role='OFFICER')
+        )
+
+    # ── 5. session / audit identity ────────────────────────────────────────
+    def test_session_and_audit_record_the_portal_identity(self):
+        ensure_seed_staff_accounts()
+        accounts = {account['role']: account for account in self._users()}
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        for role in PORTAL_ROLES:
+            officer = accounts[role]
+            session = create_officer_session(officer_user=officer, location_name='State HQ')
+            cursor.execute('SELECT * FROM officer_sessions WHERE id = ?', (session['session_id'],))
+            row = dict(zip([c[0] for c in cursor.description], cursor.fetchone()))
+            cursor.execute('SELECT * FROM system_audit_logs WHERE resource_id = ?',
+                           (session['session_id'],))
+            audit = dict(zip([c[0] for c in cursor.description], cursor.fetchone()))
+            self.assertEqual(row['officer_id'], officer['id'])
+            self.assertEqual(row['badge_number'], officer['badge_number'])
+            self.assertEqual(row['role'], role)
+            self.assertEqual(audit['user_id'], officer['id'])
+            self.assertEqual(audit['user_email'], officer['email'])
+            self.assertEqual(audit['role'], role)
+            self.assertEqual(audit['action'], 'OFFICER_AUTHENTICATED_LOGIN')
+        conn.close()
+
+    # ── 6. other accounts keep working ─────────────────────────────────────
+    def test_existing_citizen_and_admin_accounts_are_untouched(self):
+        admin = register_user(
+            name='Person 4', email='person 4', phone='Person 4',
+            password='old-admin-pass', role='ADMIN',
+        )
+        citizen = register_user(
+            name=SHARED_USERNAME, email='person1-citizen@example.test', phone='9876500003',
+            password='citizen-pass', role='CITIZEN', status='ACTIVE',
+        )
+        before = self._snapshot()
+
+        ensure_seed_staff_accounts()
+
+        after = self._snapshot()
+        for user_id in (admin['id'], citizen['id']):
+            self.assertEqual(before[user_id], after[user_id], f'{user_id} must stay byte-identical')
+
+        self.assertIsNotNone(
+            authenticate_user('Person 4', 'old-admin-pass', required_role='ADMIN')
+        )
+        self.assertIsNotNone(
+            authenticate_user(SHARED_USERNAME, 'citizen-pass', required_role='CITIZEN')
+        )
+        citizen_session = authenticate_user(SHARED_USERNAME, 'citizen-pass', required_role='CITIZEN')
+        self.assertEqual(citizen_session['id'], citizen['id'])
+        admin_session = authenticate_user('Person 4', 'old-admin-pass', required_role='ADMIN')
+        self.assertEqual(admin_session['id'], admin['id'])
+        self.assertEqual(len(self._users(role='ADMIN')), 2, 'seeded and pre-existing admins coexist')
 
 
 if __name__ == '__main__':

@@ -159,26 +159,31 @@ def _credentials_match(
 
     Identifiers are case-insensitive and may be the account username (display
     name), email address, phone number, or staff badge number. An optional role
-    narrows the lookup so identical display names across roles cannot collide.
+    narrows the lookup so the same username can serve several portals; without a
+    role, an identifier that matches more than one account is refused rather than
+    resolved by guesswork.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
     clean = (identifier or "").strip().lower()
     query = """
         SELECT * FROM users
-        WHERE LOWER(email) = ? OR LOWER(phone) = ? OR LOWER(name) = ?
-           OR LOWER(COALESCE(badge_number, '')) = ?
+        WHERE (LOWER(email) = ? OR LOWER(phone) = ? OR LOWER(name) = ?
+               OR LOWER(COALESCE(badge_number, '')) = ?)
     """
     params: List[Any] = [clean, clean, clean, clean]
     if required_role:
         query += " AND role = ?"
         params.append(required_role.upper())
     cursor.execute(query, tuple(params))
-    row = cursor.fetchone()
+    rows = cursor.fetchall()
     conn.close()
-    if not row:
+    if not rows:
         return None
-    user = dict(row)
+    if len(rows) > 1:
+        # Fail closed: nothing links this credential to one specific account.
+        return None
+    user = dict(rows[0])
     if not verify_password(password, user.get("password_hash", ""), user.get("salt", "")):
         return None
     return user

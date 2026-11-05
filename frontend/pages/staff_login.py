@@ -231,15 +231,15 @@ def _render_staff_login(
                     station_name = (station_input.value or '').strip()
                     if station_name:
                         user['station'] = station_name
-                    try:
-                        create_officer_session(
-                            officer_user=user,
-                            location_name=None,
-                            latitude=location_data['lat'],
-                            longitude=location_data['lon'],
-                        )
-                    except Exception as error:
-                        ui.notify(f'Login succeeded, but the session audit could not be saved: {error}', type='warning')
+                try:
+                    create_officer_session(
+                        officer_user=user,
+                        location_name=None,
+                        latitude=location_data['lat'],
+                        longitude=location_data['lon'],
+                    )
+                except Exception as error:
+                    ui.notify(f'Login succeeded, but the session audit could not be saved: {error}', type='warning')
 
                 set_current_user(user)
                 error_label.text = ''

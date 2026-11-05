@@ -21,21 +21,21 @@ from frontend.pages.home import create_home_page
 from frontend.pages import admin, citizen, chat, login, police, register, staff_login, verification, citizen_verification, citizen_application_status, authorized_officer_ng, officer_audit
 from backend.services.db import init_database
 from backend.services.seed_data import seed_database
-from backend.services.staff_accounts import ensure_seed_officer_accounts
+from backend.services.staff_accounts import ensure_seed_staff_accounts
 
 # Initialize database and populate seed data if empty
 init_database()
 seed_database()
 
-_officers = ensure_seed_officer_accounts()
-if _officers['created'] or _officers['existing']:
+_staff = ensure_seed_staff_accounts()
+if _staff['created'] or _staff['existing']:
     print(
-        f"[startup] officer accounts: {len(_officers['created'])} created, "
-        f"{len(_officers['existing'])} already provisioned"
+        f"[startup] staff accounts: {len(_staff['created'])} created, "
+        f"{len(_staff['existing'])} already provisioned"
     )
-if _officers['skipped']:
+if _staff['skipped']:
     print(
-        f"[startup] officer accounts {', '.join(_officers['skipped'])} not provisioned: "
+        f"[startup] staff accounts {', '.join(_staff['skipped'])} not provisioned: "
         "set SEED_OFFICER_PASSWORD to enable seeding"
     )
 
