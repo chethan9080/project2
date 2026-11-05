@@ -26,6 +26,7 @@ def clean_all_dummy_data(keep_users: bool = False) -> None:
     cursor.execute("DELETE FROM chat_messages")
     cursor.execute("DELETE FROM citizen_verifications")
     cursor.execute("DELETE FROM officer_sessions")
+    cursor.execute("DELETE FROM otp_sessions")
     cursor.execute("DELETE FROM officer_activity_logs")
     cursor.execute("DELETE FROM case_tracking")
     cursor.execute("DELETE FROM security_alerts")

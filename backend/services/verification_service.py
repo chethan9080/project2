@@ -10,18 +10,18 @@ Enforces:
 """
 
 import hashlib
+import hmac
 import json
+import os
 import random
-import time
+import re
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
 
 from backend.services.config_service import is_test_mode
 from backend.services.db import get_db_connection
-
-# In-memory transient OTP storage (cleared on restart or expiry)
-_OTP_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 # ==========================================
@@ -72,97 +72,240 @@ def validate_government_id(gov_id: str, id_type: str = "Aadhaar Card") -> Tuple[
 # ==========================================
 # 2. MOBILE OTP SERVICE & RATE LIMITING
 # ==========================================
+OTP_LENGTH = 6
+OTP_TTL_SECONDS = 600            # the code is valid for 10 minutes
+OTP_MAX_ATTEMPTS = 3             # three verification attempts per code
+OTP_RESEND_COOLDOWN_SECONDS = 30
+OTP_GRACE_SECONDS = 3600         # expired rows are pruned an hour after they lapse
+
+# Fixed code used while TEST_MODE is enabled. Production always gets a random
+# code, so this constant can never unlock a real registration.
+TEST_MODE_OTP = '123456'
+
+
+def normalize_mobile(mobile: str) -> Tuple[Optional[str], str]:
+    """Return the canonical digits an OTP session is keyed by, plus an error message."""
+    digits = ''.join(character for character in (mobile or '') if character.isdigit())
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return None, 'Mobile number must contain 10 digits, for example 98765 43210.'
+    return digits, ''
+
+
 def _hash_otp(mobile: str, otp_code: str) -> str:
     salt = f"ksp_otp_salt_{mobile.strip()}"
     return hashlib.sha256(f"{salt}_{otp_code.strip()}".encode()).hexdigest()
 
 
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat()
+
+
+def _parse_iso(value: str) -> datetime:
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def _latest_session(cursor, mobile: str) -> Optional[Dict[str, Any]]:
+    cursor.execute(
+        """
+        SELECT id, mobile, code_hash, created_at, expires_at, attempts, max_attempts, verified, delivery_status
+        FROM otp_sessions
+        WHERE mobile = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (mobile,),
+    )
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def _dispatch_over_sms(mobile: str, otp_code: str) -> Tuple[str, str]:
+    """
+    Send the code through the SMS gateway named by the environment.
+    Credentials are read from SMS_GATEWAY_URL / SMS_GATEWAY_API_KEY and are never
+    logged, and neither the code nor the request body is ever returned to the caller.
+    """
+    endpoint = (os.getenv('SMS_GATEWAY_URL') or '').strip()
+    api_key = (os.getenv('SMS_GATEWAY_API_KEY') or '').strip()
+    if not endpoint or not api_key:
+        return 'not_configured', (
+            'SMS delivery is not configured on this server, so no code could be sent. '
+            'Set SMS_GATEWAY_URL and SMS_GATEWAY_API_KEY, or start the portal with '
+            'TEST_MODE=1 to use the development OTP.'
+        )
+
+    payload = json.dumps({
+        'to': mobile,
+        'sender': (os.getenv('SMS_GATEWAY_SENDER') or 'EKSP').strip(),
+        'message': f'Your eKSP verification code is {otp_code}. It expires in 10 minutes.',
+    }).encode('utf-8')
+    request = urllib.request.Request(
+        endpoint,
+        data=payload,
+        method='POST',
+        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if 200 <= response.status < 300:
+                return 'sent', ''
+    except Exception:
+        pass
+    return 'failed', 'The SMS provider could not deliver the OTP. Please try again in a moment.'
+
+
 def send_otp(mobile: str) -> Tuple[bool, str, Optional[str]]:
     """
-    Generate and dispatch a 6-digit OTP code for citizen verification.
-    Returns (success, user_message, demo_code_if_test_mode).
+    Create a database-backed OTP session and dispatch the code.
+    Returns (success, user_message, development_code_for_the_testing_screen).
     """
-    clean_mobile = mobile.strip()
+    clean_mobile, error = normalize_mobile(mobile)
     if not clean_mobile:
-        return False, "Please provide a valid mobile number.", None
+        return False, error, None
 
-    now = time.time()
+    now = datetime.now(timezone.utc)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        previous = _latest_session(cursor, clean_mobile)
+        if previous:
+            elapsed = (now - _parse_iso(previous['created_at'])).total_seconds()
+            if 0 <= elapsed < OTP_RESEND_COOLDOWN_SECONDS:
+                remaining = int(OTP_RESEND_COOLDOWN_SECONDS - elapsed)
+                return False, f"Please wait {remaining}s before requesting a new OTP.", None
 
-    # Rate limiting: 30 seconds cooldown between requests
-    if clean_mobile in _OTP_CACHE:
-        cached = _OTP_CACHE[clean_mobile]
-        elapsed = now - cached.get("created_at", 0)
-        if elapsed < 30 and not is_test_mode():
-            remaining = int(30 - elapsed)
-            return False, f"Please wait {remaining}s before requesting a new OTP.", None
+        if is_test_mode():
+            otp_code = TEST_MODE_OTP
+            delivery_status = 'TEST_MODE'
+        else:
+            otp_code = f"{random.SystemRandom().randint(0, 10 ** OTP_LENGTH - 1):0{OTP_LENGTH}d}"
+            outcome, failure = _dispatch_over_sms(clean_mobile, otp_code)
+            if outcome != 'sent':
+                return False, failure, None
+            delivery_status = 'SENT'
 
-    otp_code = str(random.randint(100000, 999999))
-    hashed = _hash_otp(clean_mobile, otp_code)
+        # One live code per mobile number: the previous session is replaced so a
+        # resent OTP can never be satisfied by an older code.
+        cursor.execute("DELETE FROM otp_sessions WHERE mobile = ?", (clean_mobile,))
+        cursor.execute("DELETE FROM otp_sessions WHERE expires_at < ?",
+                       (_iso(now - timedelta(seconds=OTP_GRACE_SECONDS)),))
+        cursor.execute(
+            """
+            INSERT INTO otp_sessions (
+                id, mobile, code_hash, created_at, expires_at,
+                attempts, max_attempts, verified, delivery_status
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)
+            """,
+            (
+                f"otp-{uuid.uuid4().hex[:12]}",
+                clean_mobile,
+                _hash_otp(clean_mobile, otp_code),
+                _iso(now),
+                _iso(now + timedelta(seconds=OTP_TTL_SECONDS)),
+                OTP_MAX_ATTEMPTS,
+                delivery_status,
+            ),
+        )
+        conn.commit()
 
-    _OTP_CACHE[clean_mobile] = {
-        "hashed_code": hashed,
-        "created_at": now,
-        "expires_at": now + 600,  # 10 minutes expiry
-        "attempts": 0,
-        "max_attempts": 4,
-        "verified": False,
-        "raw_code_for_test": otp_code if is_test_mode() else None
-    }
-
-    if is_test_mode():
-        msg = f"OTP dispatched to {clean_mobile}. (TEST MODE Code: {otp_code} or default '123456')"
-        return True, msg, otp_code
-    else:
-        # In production, dispatch via real SMS Gateway integration
-        msg = f"OTP successfully sent to {clean_mobile}. Valid for 10 minutes."
-        return True, msg, None
+        if is_test_mode():
+            return True, (
+                f"Development OTP ready for {clean_mobile}. Use code {TEST_MODE_OTP}. "
+                "Valid for 10 minutes."
+            ), TEST_MODE_OTP
+        return True, f"OTP successfully sent to {clean_mobile} by SMS. Valid for 10 minutes.", None
+    finally:
+        conn.close()
 
 
 def verify_otp(mobile: str, input_otp: str) -> Tuple[bool, str]:
-    """Verify submitted 6-digit OTP code against session record."""
-    clean_mobile = mobile.strip()
-    clean_otp = input_otp.strip()
+    """Verify a submitted code against the stored OTP session for that mobile number."""
+    clean_mobile, error = normalize_mobile(mobile)
+    if not clean_mobile:
+        return False, error
 
-    if not clean_mobile or not clean_otp:
-        return False, "Mobile number and OTP code are required."
+    clean_otp = (input_otp or '').strip()
+    if not re.fullmatch(rf'\d{{{OTP_LENGTH}}}', clean_otp):
+        return False, f'Enter the {OTP_LENGTH}-digit OTP exactly as it was sent.'
 
-    if clean_mobile not in _OTP_CACHE:
-        # In TEST MODE, allow default mock code 123456 even without prior send
-        if is_test_mode() and clean_otp == "123456":
-            return True, "OTP Verified ✓ (TEST MODE Bypass)"
-        return False, "No active OTP session found. Please click 'Send OTP' first."
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        session = _latest_session(cursor, clean_mobile)
+        if not session:
+            return False, "No active OTP session found. Please click 'Send OTP' first."
 
-    session = _OTP_CACHE[clean_mobile]
+        if session['verified']:
+            return True, "OTP is already verified ✓"
 
-    if session["verified"]:
-        return True, "OTP is already verified ✓"
+        now = datetime.now(timezone.utc)
+        if now >= _parse_iso(session['expires_at']):
+            cursor.execute("DELETE FROM otp_sessions WHERE id = ?", (session['id'],))
+            conn.commit()
+            return False, 'OTP has expired. Please request a fresh OTP.'
 
-    now = time.time()
-    if now > session["expires_at"]:
-        del _OTP_CACHE[clean_mobile]
-        return False, "OTP has expired. Please request a fresh OTP."
+        if session['attempts'] >= session['max_attempts']:
+            cursor.execute("DELETE FROM otp_sessions WHERE id = ?", (session['id'],))
+            conn.commit()
+            return False, 'Maximum verification attempts exceeded. Please request a new code.'
 
-    if session["attempts"] >= session["max_attempts"]:
-        del _OTP_CACHE[clean_mobile]
-        return False, "Maximum verification attempts exceeded. Please request a new code."
+        if hmac.compare_digest(_hash_otp(clean_mobile, clean_otp), session['code_hash']):
+            cursor.execute("UPDATE otp_sessions SET verified = 1 WHERE id = ?", (session['id'],))
+            conn.commit()
+            return True, 'OTP Verified ✓'
 
-    # Validate hash or test code
-    input_hash = _hash_otp(clean_mobile, clean_otp)
-    is_match = (input_hash == session["hashed_code"])
-
-    if is_test_mode() and clean_otp == "123456":
-        is_match = True
-
-    if is_match:
-        session["verified"] = True
-        return True, "OTP Verified ✓"
-    else:
-        session["attempts"] += 1
-        remaining = session["max_attempts"] - session["attempts"]
+        cursor.execute("UPDATE otp_sessions SET attempts = attempts + 1 WHERE id = ?", (session['id'],))
+        conn.commit()
+        remaining = session['max_attempts'] - session['attempts'] - 1
         if remaining <= 0:
-            del _OTP_CACHE[clean_mobile]
-            return False, "Invalid OTP code. Limit reached. Session reset."
-        return False, f"Invalid OTP code. {remaining} attempt(s) remaining."
+            cursor.execute("DELETE FROM otp_sessions WHERE id = ?", (session['id'],))
+            conn.commit()
+            return False, 'Invalid OTP code. Attempt limit reached, please request a new code.'
+        return False, f'Invalid OTP code. {remaining} attempt(s) remaining.'
+    finally:
+        conn.close()
+
+
+def get_otp_session_status(mobile: str) -> Dict[str, Any]:
+    """
+    Non-secret OTP session state for a mobile number.
+    The registration screen uses this to restore step 3 after a page reload and to
+    keep the Send OTP button honest about the resend cooldown.
+    """
+    clean_mobile, error = normalize_mobile(mobile)
+    if not clean_mobile:
+        return {'valid_mobile': False, 'has_session': False, 'verified': False,
+                'attempts_remaining': 0, 'can_resend_in': 0, 'message': error}
+
+    conn = get_db_connection()
+    try:
+        session = _latest_session(conn.cursor(), clean_mobile)
+    finally:
+        conn.close()
+
+    base = {'valid_mobile': True, 'has_session': False, 'verified': False,
+            'attempts_remaining': OTP_MAX_ATTEMPTS, 'can_resend_in': 0, 'message': ''}
+    if not session:
+        return base
+
+    now = datetime.now(timezone.utc)
+    expired = now >= _parse_iso(session['expires_at'])
+    return {
+        'valid_mobile': True,
+        'has_session': not expired,
+        'expired': expired,
+        'verified': bool(session['verified']) and not expired,
+        'attempts_remaining': 0 if expired else max(0, session['max_attempts'] - session['attempts']),
+        'can_resend_in': max(0, int(OTP_RESEND_COOLDOWN_SECONDS - (now - _parse_iso(session['created_at'])).total_seconds())),
+        'delivery_status': session['delivery_status'],
+    }
 
 
 # ==========================================

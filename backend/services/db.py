@@ -269,6 +269,22 @@ def init_database() -> None:
     );
     """)
 
+    # 11A. Mobile OTP Sessions (citizen registration step 3)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS otp_sessions (
+        id TEXT PRIMARY KEY,
+        mobile TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts > 0),
+        verified INTEGER NOT NULL DEFAULT 0,
+        delivery_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(delivery_status IN ('PENDING', 'SENT', 'TEST_MODE'))
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_otp_sessions_mobile ON otp_sessions(mobile, created_at);")
+
     # 11B. Citizen Registration Applications (Verification Officer review queue)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS citizen_applications (

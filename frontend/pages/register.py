@@ -9,6 +9,7 @@ Step 5: Location Permission (browser geolocation, jurisdiction routing)
 → Application Submitted → Status Page (dashboard access locked until approved)
 """
 
+import asyncio
 import base64
 import json
 import os
@@ -18,15 +19,33 @@ from frontend.components.navbar import create_public_header
 from backend.services.auth_service import register_user, set_current_user, delete_unverified_citizen
 from backend.services.citizen_registration_service import create_citizen_application
 from backend.services.verification_service import (
+    TEST_MODE_OTP,
+    get_otp_session_status,
     mask_government_id,
-    validate_government_id,
+    normalize_mobile,
     send_otp,
-    verify_otp,
+    validate_government_id,
     verify_location_capture,
+    verify_otp,
     record_citizen_verification_event,
 )
 
 GOV_ID_TYPES = ["Aadhaar Card", "Voter ID Card", "Passport"]
+
+# The wizard keeps its typed details in NiceGUI tab storage so a websocket
+# reconnect or a browser reload can resume the same step instead of restarting.
+WIZARD_STORAGE_KEY = 'citizen_registration_wizard'
+
+# Binary captures and the password are deliberately absent: uploads stay in memory
+# for the submit, and the password is never written to server-side storage.
+PERSISTED_STATE_KEYS = (
+    's1_name', 's1_email', 's1_dob', 's1_gender',
+    's2_gov_id_type', 's2_gov_id', 's2_masked', 's2_doc_name', 's2_doc_ext',
+    's3_mobile', 's3_otp_sent', 's3_otp_verified',
+    's4_photo_label', 's4_photo_ext',
+    's5_state', 's5_district', 's5_address', 's5_latitude', 's5_longitude',
+    's5_location_verified', 's5_location_name', 'current_step',
+)
 
 STEP_TITLES = [
     "Account Details",
@@ -39,11 +58,24 @@ STEP_TITLES = [
 STEP_ICONS = ["person", "badge", "sms", "camera_alt", "location_on"]
 
 
+async def _restore_wizard_state() -> dict:
+    """Return the wizard fields saved for this browser tab, if any."""
+    try:
+        await asyncio.wait_for(ui.context.client.connected(), 3.0)
+        return dict(nicegui_app.storage.tab.get(WIZARD_STORAGE_KEY, {}))
+    except (TimeoutError, RuntimeError):
+        return {}
+
+
 @ui.page('/register')
-def create_register_page() -> None:
+async def create_register_page() -> None:
     """5-Step Citizen Verification & Registration Wizard."""
     ui.page_title('Citizen Registration | eKSP Online FIR Portal')
     create_public_header()
+
+    # Tab storage only exists once the websocket is attached, so the saved wizard
+    # fields are read before the step cards are built.
+    restored_state = await _restore_wizard_state()
 
     # ────────────────────────────────────────────────────────────────
     # STATE
@@ -70,6 +102,9 @@ def create_register_page() -> None:
         'registered_user': None,
         'submitting': False,
     }
+    for restored_key in PERSISTED_STATE_KEYS:
+        if restored_key in restored_state:
+            state[restored_key] = restored_state[restored_key]
 
     # ────────────────────────────────────────────────────────────────
     # PAGE SHELL
@@ -259,39 +294,91 @@ def create_register_page() -> None:
 
                 s3_mobile_ref = ui.input('Mobile Number *', placeholder='+91 98765 43210').classes('w-full')
                 s3_otp_ref = ui.input('Enter 6-Digit OTP *', placeholder='______').classes('w-full')
+                s3_otp_ref.props('autocomplete=one-time-code maxlength=6')
                 s3_demo_label = ui.label('').classes('text-xs font-mono text-amber-700 font-bold')
                 s3_status = ui.label('').classes('text-xs font-semibold mt-1')
+                s3_note = ui.label('').classes('text-xs text-slate-500 mt-1')
+                otp_request = {'in_flight': False}
 
-                def do_send_otp():
-                    ok, msg, demo_code = send_otp(s3_mobile_ref.value)
+                def set_otp_positive(message: str) -> None:
+                    s3_status.text = f'✅ {message}'
+                    s3_status.classes(remove='text-red-600', add='text-green-700')
+
+                def set_otp_problem(message: str) -> None:
+                    s3_status.text = f'⚠ {message}'
+                    s3_status.classes(remove='text-green-700', add='text-red-600')
+
+                def set_otp_note(message: str) -> None:
+                    s3_note.text = message
+
+                def sync_otp_state() -> None:
+                    """Mirror the stored OTP session so a reload cannot lose step 3."""
+                    clean_mobile, _ = normalize_mobile(s3_mobile_ref.value or state.get('s3_mobile', ''))
+                    if not clean_mobile or otp_request['in_flight']:
+                        return
+                    session = get_otp_session_status(clean_mobile)
+                    if session['verified']:
+                        state['s3_otp_verified'] = True
+                        s3_demo_label.text = ''
+                        set_otp_note('')
+                        send_otp_button.enable()
+                        set_otp_positive('Mobile number verified. Continue to the photo step.')
+                        return
+
+                    state['s3_otp_verified'] = False
+                    if not session['has_session']:
+                        send_otp_button.enable()
+                        return
+                    if session['delivery_status'] == 'TEST_MODE':
+                        s3_demo_label.text = f'🧪 Development OTP: {TEST_MODE_OTP}'
+                    if session['can_resend_in'] > 0:
+                        send_otp_button.disable()
+                    else:
+                        send_otp_button.enable()
+                    set_otp_note(
+                        f"OTP active for {clean_mobile} — {session['attempts_remaining']} attempt(s) left. "
+                        + (f"New code available in {session['can_resend_in']}s."
+                           if session['can_resend_in'] else 'You can request a new code.')
+                    )
+
+                def do_send_otp() -> None:
+                    if otp_request['in_flight'] or not send_otp_button.enabled:
+                        return
+                    otp_request['in_flight'] = True
+                    try:
+                        ok, msg, demo_code = send_otp(s3_mobile_ref.value)
+                    finally:
+                        otp_request['in_flight'] = False
                     if ok:
+                        state['s3_mobile'] = s3_mobile_ref.value
                         state['s3_otp_sent'] = True
                         state['s3_demo_otp'] = demo_code or ''
-                        s3_status.text = f'✅ {msg}'
-                        s3_status.classes(remove='text-red-600')
-                        s3_status.classes(add='text-green-700')
+                        s3_error.text = ''
+                        set_otp_positive(msg)
                         if demo_code:
-                            s3_demo_label.text = f'🧪 Demo OTP: {demo_code} (also "123456" accepted)'
+                            s3_demo_label.text = f'🧪 Development OTP: {demo_code}'
+                        send_otp_button.disable()
                     else:
-                        s3_status.text = f'⚠ {msg}'
-                        s3_status.classes(remove='text-green-700')
-                        s3_status.classes(add='text-red-600')
+                        set_otp_problem(msg)
+                    save_wizard_state()
 
-                ui.button('📲 Send OTP', on_click=do_send_otp).props('unelevated').classes(
+                send_otp_button = ui.button('📲 Send OTP', on_click=do_send_otp).props('unelevated').classes(
                     'w-full bg-emerald-600 text-white font-bold rounded-xl py-2 text-sm mt-2'
                 )
 
                 s3_error = ui.label('').classes('text-red-600 text-xs font-semibold mt-1')
 
-                def go_step3_next():
+                def go_step3_next() -> None:
                     ok, msg = verify_otp(s3_mobile_ref.value, s3_otp_ref.value)
                     if not ok:
                         s3_error.text = f'⚠ {msg}'
+                        sync_otp_state()
                         return
                     state['s3_mobile'] = s3_mobile_ref.value
                     state['s3_otp_verified'] = True
                     s3_error.text = ''
                     ui.notify('OTP Verified ✓', type='positive')
+                    save_wizard_state()
                     go_to_step(3)
 
                 with ui.row().classes('w-full gap-2 mt-4'):
@@ -299,6 +386,10 @@ def create_register_page() -> None:
                     ui.button('Verify OTP & Continue →', on_click=go_step3_next, icon='arrow_forward').props(
                         'unelevated'
                     ).classes('flex-1 bg-blue-800 text-white font-bold rounded-xl py-2 text-sm')
+
+                # Keeps the resend countdown, attempt counter and verified badge honest
+                # after a page reload or a Render cold start.
+                ui.timer(2.0, sync_otp_state)
 
             step_panels.append(panel3)
 
@@ -513,8 +604,21 @@ def create_register_page() -> None:
                     if not (s5_address_ref.value or '').strip():
                         s5_error.text = '⚠ Please enter your residential address.'
                         return
-                    if not state.get('s2_doc_bytes') or not state.get('s4_photo_bytes'):
-                        s5_error.text = '⚠ Your ID document and photograph are required before submission.'
+                    if not state.get('s2_doc_bytes'):
+                        s5_error.text = '⚠ Please re-attach your Government ID document in Step 2.'
+                        go_to_step(1)
+                        return
+                    if not state.get('s4_photo_bytes'):
+                        s5_error.text = '⚠ Please capture or upload your photograph in Step 4.'
+                        go_to_step(3)
+                        return
+                    if not state.get('s3_otp_verified'):
+                        s5_error.text = '⚠ Please verify your mobile number with the OTP first.'
+                        go_to_step(2)
+                        return
+                    if not (state.get('s1_password') or '').strip():
+                        s5_error.text = '⚠ Please re-enter your password in Step 1 before submitting.'
+                        go_to_step(0)
                         return
 
                     state['submitting'] = True
@@ -615,10 +719,48 @@ def create_register_page() -> None:
         # ────────────────────────────────────────────────────────────────
         # NAVIGATION HELPER
         # ────────────────────────────────────────────────────────────────
+        wizard_fields = {
+            's1_name': s1_name_ref, 's1_email': s1_email_ref,
+            's1_dob': s1_dob_ref, 's1_gender': s1_gender_ref,
+            's2_gov_id_type': s2_gov_type_ref, 's2_gov_id': s2_gov_id_ref,
+            's3_mobile': s3_mobile_ref,
+            's5_state': s5_state_ref, 's5_district': s5_district_ref, 's5_address': s5_address_ref,
+        }
+
+        def save_wizard_state() -> None:
+            for key, field in wizard_fields.items():
+                state[key] = field.value
+            try:
+                nicegui_app.storage.tab[WIZARD_STORAGE_KEY] = {key: state[key] for key in PERSISTED_STATE_KEYS}
+            except RuntimeError:
+                pass
+
         def go_to_step(step: int):
             for i, panel in enumerate(step_panels):
                 panel.set_visibility(i == step)
             state['current_step'] = step
+            save_wizard_state()
+
+        # Restore the typed values into the fields, then resume on the saved step.
+        for restored_key, field in wizard_fields.items():
+            if state.get(restored_key) not in (None, ''):
+                field.value = state[restored_key]
+
+        # Resume on the interrupted step. The password and the uploaded images are
+        # deliberately not persisted, so those two fields are asked for again.
+        resume_step = int(state.get('current_step') or 0)
+        if resume_step > 0:
+            go_to_step(resume_step)
+            gaps = []
+            if not state.get('s1_password'):
+                gaps.append('the password must be typed again in Step 1')
+            if not state.get('s2_doc_bytes'):
+                gaps.append('the ID document upload must be repeated in Step 2')
+            if not state.get('s4_photo_bytes'):
+                gaps.append('the photograph must be added again in Step 4')
+            if gaps:
+                ui.notify(f"Registration resumed at step {resume_step + 1} — "
+                          f"{', '.join(gaps)}. The OTP stays verified.", type='warning')
 
         with ui.row().classes('text-xs text-slate-400 mt-2 gap-1'):
             ui.label('Already registered?')
