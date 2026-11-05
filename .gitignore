@@ -1,0 +1,37 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local environment files (never commit real configuration or keys)
+.env
+.env.*
+!.env.example
+
+# SQLite ledgers — real case data stays out of the repository
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Private uploads: citizen ID documents, photographs, complaint annexures,
+# investigation evidence and generated FIR PDFs
+data/secure_uploads/
+
+# NiceGUI local storage
+.nicegui/
+
+# Local scratch / generated analysis artifacts
+.DS_Store
+2026-08-12/
+all_frontend_ui_strings.json
+filtered_ui_strings.json
+scratch_ui_strings.json

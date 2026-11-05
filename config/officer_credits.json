@@ -1,0 +1,17 @@
+{
+  "milestones": {
+    "CASE_ACCEPTED": {"points": 5, "label": "Accepted and started the assigned investigation"},
+    "REQUIRED_UPDATES_COMPLETED": {"points": 10, "label": "Completed the required investigation stages"},
+    "INVESTIGATION_COMPLETED": {"points": 20, "label": "Completed the investigation"},
+    "REPORT_SUBMITTED": {"points": 10, "label": "Submitted the authorised investigation report / charge sheet"},
+    "CASE_COMPLETED": {"points": 15, "label": "Completed the assigned case"}
+  },
+  "star_levels": [
+    {"min_points": 0, "stars": 0, "level": "New Investigator"},
+    {"min_points": 25, "stars": 1, "level": "Bronze Investigator"},
+    {"min_points": 60, "stars": 2, "level": "Silver Investigator"},
+    {"min_points": 120, "stars": 3, "level": "Gold Investigator"},
+    {"min_points": 200, "stars": 4, "level": "Distinguished Investigator"},
+    {"min_points": 300, "stars": 5, "level": "Exemplary Investigator"}
+  ]
+}

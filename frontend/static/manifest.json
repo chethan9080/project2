@@ -1,0 +1,22 @@
+{
+  "name": "e-FIR Sanctuary",
+  "short_name": "e-FIR",
+  "description": "Serene, transparent e-FIR Law Enforcement Sanctuary for citizens, police officers, and administrators.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F5EBE0",
+  "theme_color": "#1F3A2B",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

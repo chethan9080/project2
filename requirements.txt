@@ -1,0 +1,14 @@
+# e-FIR Law Enforcement Portal — runtime dependencies
+# Python 3.11+ (verified on 3.14)
+
+nicegui==3.15.0
+fastapi>=0.115,<1.0
+uvicorn>=0.30
+python-dotenv>=1.2,<2.0
+python-multipart>=0.0.9
+pydantic>=2.7,<3.0
+reportlab>=4.2
+
+# Repository tooling only (scripts/); not imported by the application
+Pillow>=10.0
+deep-translator>=1.11.4
