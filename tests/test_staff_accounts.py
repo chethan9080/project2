@@ -35,7 +35,9 @@ from backend.services.staff_accounts import ensure_seed_officer_accounts
 from backend.services.verification_service import create_officer_session
 
 SEED_USERNAMES = 'person1,person2,person3'
-SEED_PASSWORD = 'person@1'
+# A fixture password only: these tests run against a throwaway database, so no
+# real account credential ever appears here.
+SEED_PASSWORD = 'seed-fixture-password'
 SEED_KEYS = ('SEED_OFFICER_USERNAMES', 'SEED_OFFICER_PASSWORD', 'SEED_OFFICER_EMAIL_DOMAIN')
 
 
