@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.services.db import get_db_connection
-from backend.services.notification_service import create_notification
+from backend.services.notification_service import create_notification, notify_role
 from backend.services.case_tracking_service import (
     CASE_STAGES,
     STAGE_LABELS,
@@ -391,6 +391,18 @@ def record_investigation_action(
         event_id=f"citizen-{tracking_id}",
         severity='SUCCESS' if action == 'COMPLETED' else 'INFO',
     )
+    notify_role(
+        "VERIFICATION_OFFICER",
+        f"Case Progress: {label}",
+        (f"FIR {fir['fir_number']} — {officer_user.get('name', 'Officer')} marked {label} "
+         f"as {ACTION_LABELS[action].lower()}."),
+        f"investigation-verification-{tracking_id}",
+        fir_id=fir_id,
+        complaint_id=fir.get('complaint_id'),
+        notification_type='INVESTIGATION_UPDATE',
+        severity='INFO',
+        exclude_user_id=officer_user.get('id'),
+    )
     _notify_admins(
         fir,
         title=f"{label} — {ACTION_LABELS[action]}",
@@ -430,16 +442,10 @@ def _transition_error(state: Dict[str, Any], stage: str) -> str:
 
 def _notify_admins(fir: Dict[str, Any], title: str, message: str, event_id: str,
                    notification_type: str) -> None:
-    conn = get_db_connection()
-    admins = [r['id'] for r in conn.execute(
-        "SELECT id FROM users WHERE role = 'ADMIN' AND status = 'ACTIVE'"
-    ).fetchall()]
-    conn.close()
-    for admin_id in admins:
-        create_notification(
-            user_id=admin_id, fir_id=fir['id'], title=title, message=message,
-            notification_type=notification_type, event_id=f"{event_id}-{admin_id}", severity='INFO',
-        )
+    notify_role(
+        'ADMIN', title, message, event_id,
+        fir_id=fir['id'], notification_type=notification_type,
+    )
 
 
 def _publish(fir: Dict[str, Any], event_type: str, **extra) -> None:
@@ -791,7 +797,7 @@ def _case_rows(where: str, params: tuple) -> List[Dict[str, Any]]:
         SELECT f.id, f.fir_number, f.reference_number, f.status, f.incident_type, f.incident_location,
                f.incident_date, f.police_station, f.citizen_id, f.assigned_officer_id, f.complaint_id,
                f.created_at, f.updated_at,
-               u.name AS citizen_name, o.name AS officer_name,
+               u.name AS citizen_name, u.username AS citizen_username, o.name AS officer_name,
                c.reference AS complaint_reference, c.category AS complaint_category,
                (SELECT a.assigned_at FROM officer_assignments a
                  WHERE a.fir_id = f.id AND a.officer_id = f.assigned_officer_id
@@ -924,6 +930,161 @@ def get_admin_investigation_overview() -> List[Dict[str, Any]]:
     return rows
 
 
+# Columns an officer can amend on a registered FIR, worded for the authorized
+# modification review. Unknown names fall back to their spaced column name.
+FIR_FIELD_LABELS = {
+    'incident_type': 'Offence category',
+    'incident_date': 'Incident date',
+    'incident_time': 'Incident time',
+    'incident_location': 'Place of occurrence',
+    'description': 'Complaint description',
+    'accused_details': 'Accused / suspect details',
+    'witness_details': 'Witness details',
+    'status': 'FIR status',
+    'police_station': 'Police station',
+}
+
+
+def _json_rows(raw: Optional[str], default: Any) -> Any:
+    try:
+        return json.loads(raw or '') or default
+    except (ValueError, TypeError):
+        return default
+
+
+def _diff_rows(event: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Previous vs updated value for every field one change event recorded."""
+    old_values = _json_rows(event.get('old_values_json'), {})
+    new_values = _json_rows(event.get('new_values_json'), {})
+    fields = _json_rows(event.get('changed_fields_json'), [])
+    diffs = []
+    for field in fields:
+        diffs.append({
+            'field': field,
+            'label': FIR_FIELD_LABELS.get(field) or str(field).replace('_', ' ').capitalize(),
+            'old': str(old_values.get(field, '') or ''),
+            'new': str(new_values.get(field, '') or ''),
+        })
+    return diffs
+
+
+def get_admin_case_record(fir_id: str, admin_user: Dict[str, Any]) -> Dict[str, Any]:
+    """Complete authorized case record: origin, registration, documents, every
+    recorded modification, the SHA-256 hash of each version and closure state.
+
+    Authorized Officers only; hashes and audit detail are not reachable through
+    any other role or page.
+    """
+    if not admin_user or admin_user.get('role') != 'ADMIN':
+        raise PermissionError('Authorized Officer access required.')
+    cases = _case_rows('f.id = ?', (fir_id,))
+    if not cases:
+        raise ValueError('FIR not found.')
+    case = cases[0]
+
+    conn = get_db_connection()
+    citizen = dict(conn.execute("""
+        SELECT id, name, username, email, phone, status, role, district, address,
+               gov_id_masked, verification_status, verified_at, created_at
+        FROM users WHERE id = ?
+    """, (case.get('citizen_id'),)).fetchone() or {})
+    application = dict(conn.execute("""
+        SELECT reference, full_name, submitted_at, status, reviewed_at, reviewed_by,
+               reviewed_by_name, district, state, gov_id_type, gov_id_masked, username
+        FROM citizen_applications WHERE citizen_id = ?
+        ORDER BY reviewed_at DESC, submitted_at DESC LIMIT 1
+    """, (case.get('citizen_id'),)).fetchone() or {})
+    complaint = dict(conn.execute("""
+        SELECT id, reference, category, title, description, location, landmark, area,
+               district, state, police_station, incident_date, incident_time,
+               submitted_at, status, verification_status, verified_by_name, verified_at,
+               verification_remarks, rejection_reason, fir_edited_by_name, fir_edited_at
+        FROM complaints WHERE id = ?
+    """, (case.get('complaint_id'),)).fetchone() or {})
+
+    # The version-1 row is the registration itself: its author registered the FIR.
+    registration = dict(conn.execute("""
+        SELECT v.created_at, v.change_reason, v.current_hash, v.previous_hash,
+               u.name AS officer_name, u.role AS officer_role,
+               u.badge_number AS officer_badge, u.station AS officer_station
+        FROM fir_versions v
+        LEFT JOIN users u ON v.created_by = u.id
+        WHERE v.fir_id = ? AND v.version_number = 1
+    """, (fir_id,)).fetchone() or {})
+    if not registration:
+        registration = {
+            'created_at': case.get('created_at'),
+            'change_reason': 'FIR registered',
+            'officer_name': None,
+            'officer_role': 'VERIFICATION_OFFICER',
+        }
+
+    documents = [dict(r) for r in conn.execute("""
+        SELECT id, document_type, version, file_name, file_path, sha256,
+               generated_by_name, generated_at, is_current
+        FROM fir_documents WHERE fir_id = ? ORDER BY version DESC, generated_at DESC
+    """, (fir_id,)).fetchall()]
+
+    verification_events = [dict(r) for r in conn.execute("""
+        SELECT id, action, status_from, status_to, remarks, actor_name, actor_role,
+               actor_badge, created_at
+        FROM complaint_verification_events WHERE complaint_id = ?
+        ORDER BY created_at ASC
+    """, (complaint.get('id'),)).fetchall()] if complaint.get('id') else []
+
+    closure = dict(conn.execute("""
+        SELECT previous_stage, new_stage, action, remarks, public_note, timestamp,
+               updated_by_officer_name, updated_by_officer_badge
+        FROM case_tracking WHERE fir_id = ? AND new_stage = 'CASE_CLOSED'
+        ORDER BY timestamp DESC LIMIT 1
+    """, (fir_id,)).fetchone() or {})
+    counts = {
+        'complaints': conn.execute(
+            "SELECT COUNT(*) FROM complaints WHERE citizen_id = ?", (case.get('citizen_id'),)
+        ).fetchone()[0],
+        'firs': conn.execute(
+            "SELECT COUNT(*) FROM firs WHERE citizen_id = ?", (case.get('citizen_id'),)
+        ).fetchone()[0],
+    }
+    conn.close()
+
+    from backend.services.fir_service import get_fir_changes, get_fir_versions
+    from data.integrity import get_hash_chain_status
+
+    versions = get_fir_versions(fir_id, actor_user=admin_user)
+    events = get_fir_changes(fir_id, actor_user=admin_user)
+    for event in events:
+        event['diffs'] = _diff_rows(event)
+
+    return {
+        'case': case,
+        'citizen': citizen,
+        'application': application,
+        'counts': counts,
+        'complaint': complaint,
+        'registration': registration,
+        'documents': documents,
+        'verification_events': verification_events,
+        'verification_changes': [e for e in events if e.get('actor_role') == 'VERIFICATION_OFFICER'],
+        # Police staff are stored with role OFFICER; anything not a Verification
+        # Officer amendment is shown in the police modification section.
+        'officer_changes': [e for e in events if e.get('actor_role') != 'VERIFICATION_OFFICER'],
+        'versions': [{
+            'version_number': v.get('version_number'),
+            'created_at': v.get('created_at'),
+            'change_reason': v.get('change_reason'),
+            'previous_hash': v.get('previous_hash'),
+            'current_hash': v.get('current_hash'),
+            'creator_name': v.get('creator_name'),
+            'creator_role': v.get('creator_role'),
+            'creator_badge': v.get('creator_badge'),
+        } for v in versions],
+        'chain': get_hash_chain_status(fir_id),
+        'closure': closure,
+        'is_closed': case.get('is_closed') or bool(closure),
+    }
+
+
 def get_admin_case_detail(fir_id: str, admin_user: Dict[str, Any]) -> Dict[str, Any]:
     if not admin_user or admin_user.get('role') != 'ADMIN':
         raise PermissionError('Administrator access required.')
@@ -949,6 +1110,50 @@ def get_admin_case_detail(fir_id: str, admin_user: Dict[str, Any]) -> Dict[str, 
         'entries': list_investigation_entries(fir_id, admin_user),
         'assignments': assignments,
         'credits': credits,
+        'record': get_admin_case_record(fir_id, admin_user),
+    }
+
+
+def get_admin_officer_record(officer_id: str, admin_user: Dict[str, Any]) -> Dict[str, Any]:
+    """Police Officer verification dossier: identity, account decisions, assignments and cases."""
+    if not admin_user or admin_user.get('role') != 'ADMIN':
+        raise PermissionError('Authorized Officer access required.')
+    conn = get_db_connection()
+    row = conn.execute("""
+        SELECT id, name, username, email, phone, badge_number, rank, station, district, address,
+               status, role, verification_status, verified_at, created_at, updated_at
+        FROM users WHERE id = ? AND role = 'OFFICER'
+    """, (officer_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError('Police officer account not found.')
+    officer = dict(row)
+    assignments = [dict(r) for r in conn.execute("""
+        SELECT a.*, f.fir_number, f.status AS fir_status, f.incident_type,
+               u.name AS citizen_name, b.name AS assigned_by_name
+        FROM officer_assignments a
+        JOIN firs f ON a.fir_id = f.id
+        LEFT JOIN users u ON f.citizen_id = u.id
+        LEFT JOIN users b ON a.assigned_by = b.id
+        WHERE a.officer_id = ? ORDER BY a.assigned_at DESC
+    """, (officer_id,)).fetchall()]
+    decisions = [dict(r) for r in conn.execute("""
+        SELECT l.id, l.timestamp, l.action, l.details, l.role, l.user_email,
+               a.name AS decided_by_name, a.badge_number AS decided_by_badge
+        FROM system_audit_logs l
+        LEFT JOIN users a ON l.user_id = a.id
+        WHERE l.action = 'OFFICER_STATUS_UPDATE' AND l.resource_id = ?
+        ORDER BY l.timestamp DESC
+    """, (officer_id,)).fetchall()]
+    conn.close()
+    cases = get_officer_cases(officer_id)
+    return {
+        'officer': officer,
+        'cases': cases,
+        'stats': compute_case_stats(cases),
+        'assignments': assignments,
+        'decisions': decisions,
+        'performance': get_officer_performance(officer_id),
     }
 
 

@@ -209,7 +209,7 @@ def create_topbar(title: str = 'Online FIR Portal') -> None:
                 elif user_role == "VERIFICATION_OFFICER":
                     notif_path = "/verification/notifications"
                 elif user_role == "ADMIN":
-                    notif_path = "/admin/audit-logs"
+                    notif_path = "/admin/notifications"
                 else:
                     notif_path = "/police/notifications"
                 with ui.button(icon='notifications', on_click=lambda p=notif_path: ui.navigate.to(p)).props('flat round color=white size=sm').classes('relative text-white'):
@@ -239,9 +239,18 @@ def create_topbar(title: str = 'Online FIR Portal') -> None:
                             watch_notifications(), name='topbar-notification-badge'
                         )
 
+                        def resync_badge() -> None:
+                            # Push events are dropped while a tab is reconnecting, so the badge
+                            # also re-reads the database periodically and cannot stay stale.
+                            with client:
+                                unread_badge.refresh()
+
+                        resync_timer = ui.timer(30.0, resync_badge)
+
                         def stop_badge_listener() -> None:
                             unsubscribe(event_queue)
                             event_listener.cancel()
+                            resync_timer.deactivate()
 
                         client.on_disconnect(stop_badge_listener)
 

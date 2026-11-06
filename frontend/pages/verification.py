@@ -7,7 +7,7 @@ Routes:
 - /verification/complaints          "Verify Queries" complaint verification queue
 - /verification/complaint/{id}      complaint review & verification decisions
 - /verification/firs                "Verify Your FIR" — verified complaints + registered FIRs
-- /verification/fir-register/{id}   officer assignment, FIR registration, PDF generation
+- /verification/fir-register/{id}   FIR detail review, officer assignment, draft document, registration
 - /verification/fir/{id}            FIR case file, officer reassignment, PDF document
 - /verification/history             append-only verification history and audit
 - /verification/notifications       notification center (per-item read state)
@@ -17,7 +17,7 @@ Everything shown is read from the database. Status changes are persisted,
 append-only audit events are recorded, the citizen is notified, and open
 dashboards receive the change over the in-process websocket event bus.
 """
-
+import base64
 import json
 from datetime import datetime
 
@@ -31,8 +31,9 @@ from backend.services.auth_service import (
     update_staff_profile,
 )
 from backend.services.complaint_evidence_service import evidence_bytes
-from backend.services.complaint_service import assign_officer_to_complaint
+from backend.services.complaint_service import COMPLAINT_CATEGORIES, assign_officer_to_complaint
 from backend.services.complaint_verification_service import (
+    FIR_DETAIL_LABELS,
     action_label,
     get_active_police_officers,
     get_complaint_for_verification,
@@ -45,6 +46,7 @@ from backend.services.complaint_verification_service import (
     get_verification_history,
     get_verification_queue,
     record_complaint_verification_action,
+    update_fir_details_before_registration,
     verification_label,
 )
 from backend.services.fir_document_service import (
@@ -52,6 +54,7 @@ from backend.services.fir_document_service import (
     get_current_document,
     list_documents,
     read_document_bytes,
+    render_draft_document_for_complaint,
 )
 from backend.services.fir_service import (
     assign_officer_to_fir,
@@ -705,6 +708,7 @@ def verification_complaint_detail_page(complaint_id: str) -> None:
                         )
                     for label, value, icon in [
                         ('Citizen', record.get('citizen_name') or record.get('applicant_name') or 'Not recorded', 'badge'),
+                        ('Citizen Username', record.get('citizen_username') or 'Not issued yet', 'person_search'),
                         ('Mobile', record.get('citizen_phone') or 'Not recorded', 'phone'),
                         ('Email', record.get('citizen_email') or 'Not recorded', 'email'),
                         ('Category', record.get('category') or 'Not recorded', 'category'),
@@ -1097,7 +1101,148 @@ def fir_registration_page(complaint_id: str) -> None:
                 ).classes('text-sm font-bold text-amber-900')
             return
 
-        with ui.row().classes('w-full gap-4 flex-wrap items-start'):
+        # ── Officer review: edit the FIR details before registration ───────
+        loaded = {column: (complaint.get(column) or '') for column in FIR_DETAIL_LABELS}
+        snapshot = dict(loaded)
+        fields: dict = {}
+        category_options = list(COMPLAINT_CATEGORIES)
+        if loaded['category'] and loaded['category'] not in category_options:
+            category_options.append(loaded['category'])
+
+        with ui.card().classes('w-full p-6 bg-white border-2 border-emerald-800/25 rounded-3xl shadow-sm'):
+            with ui.row().classes('w-full items-center justify-between flex-wrap gap-2 mb-1'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('edit_note', size='sm').classes('text-emerald-800')
+                    ui.label('Review & Edit FIR Details Before Registration').classes(
+                        'text-base font-bold text-slate-900 fantasy-title'
+                    )
+                ui.badge('OFFICER REVIEW').classes(
+                    'bg-emerald-100 text-emerald-900 font-bold text-[10px] px-3 py-1'
+                )
+            ui.label(
+                'Correct or complete the details the official FIR will carry. Saving writes them to the '
+                'complaint record, appends them to the verification history and hands them to FIR '
+                'registration. Accused and witness details stay on the police record and are never shown '
+                'to the citizen. The draft document preview is built from the saved values.'
+            ).classes('text-[11px] text-slate-600 leading-relaxed mb-4')
+
+            def add_detail_field(column: str, kind: str, width: str) -> None:
+                label = FIR_DETAIL_LABELS[column]
+                if column in ('category', 'description', 'location'):
+                    label = f'{label} *'
+                if kind == 'select':
+                    element = ui.select(category_options, value=loaded[column] or category_options[0], label=label)
+                elif kind == 'textarea':
+                    element = ui.textarea(label=label, value=loaded[column]).props('autogrow')
+                else:
+                    element = ui.input(label=label, value=loaded[column])
+                element.props('outlined').classes(width)
+                fields[column] = element
+
+            with ui.row().classes('w-full gap-3 flex-wrap items-start'):
+                add_detail_field('category', 'select', 'flex-1 min-w-44')
+                add_detail_field('police_station', 'input', 'flex-1 min-w-44')
+                add_detail_field('incident_date', 'input', 'flex-1 min-w-40')
+                add_detail_field('incident_time', 'input', 'flex-1 min-w-32')
+
+            with ui.row().classes('w-full gap-3 flex-wrap items-start mt-3'):
+                add_detail_field('location', 'input', 'flex-1 min-w-52')
+                add_detail_field('landmark', 'input', 'flex-1 min-w-40')
+                add_detail_field('area', 'input', 'flex-1 min-w-36')
+                add_detail_field('district', 'input', 'flex-1 min-w-36')
+                add_detail_field('state', 'input', 'flex-1 min-w-36')
+
+            with ui.column().classes('w-full gap-3 mt-3'):
+                add_detail_field('description', 'textarea', 'w-full')
+                add_detail_field('accused_details', 'textarea', 'w-full')
+                add_detail_field('witness_details', 'textarea', 'w-full')
+
+            def save_fir_details() -> None:
+                payload = {column: element.value for column, element in fields.items()}
+                try:
+                    updated = update_fir_details_before_registration(complaint['id'], payload, user)
+                except (PermissionError, ValueError) as error:
+                    ui.notify(str(error), type='negative')
+                    return
+                except Exception as error:  # pragma: no cover - UI boundary
+                    ui.notify(f'Could not save the FIR details: {error}', type='negative')
+                    return
+                for column, element in fields.items():
+                    stored = updated.get(column) or ''
+                    element.value = stored
+                    snapshot[column] = stored
+                status_label.text = (
+                    f"Saved by {user.get('name') or 'Officer'} · {_fmt(updated.get('updated_at'))}"
+                )
+                ui.notify('FIR details saved. Registration will use these values.', type='positive')
+                record_summary.refresh()
+
+            def preview_draft_document() -> None:
+                try:
+                    pdf_bytes, file_name = render_draft_document_for_complaint(complaint['id'], user)
+                except (PermissionError, ValueError) as error:
+                    ui.notify(str(error), type='negative')
+                    return
+                except Exception as error:  # pragma: no cover - UI boundary
+                    ui.notify(f'Draft preview failed: {error}', type='negative')
+                    return
+                encoded = base64.b64encode(pdf_bytes).decode('ascii')
+                with ui.dialog() as dialog, ui.card().classes(
+                    'w-full max-w-5xl p-4 gap-3 bg-white rounded-3xl shadow-2xl'
+                ):
+                    with ui.row().classes('w-full items-center justify-between flex-wrap gap-2'):
+                        with ui.column().classes('gap-0'):
+                            ui.label('Draft FIR Document — review before registration').classes(
+                                'text-base font-bold text-slate-900 fantasy-title'
+                            )
+                            ui.label(
+                                f'{file_name} · built from the values stored in the complaint record'
+                            ).classes('text-[10px] text-slate-500 font-mono')
+                        with ui.row().classes('gap-2'):
+                            ui.button(
+                                'Download Draft PDF', icon='download',
+                                on_click=lambda: ui.download(pdf_bytes, file_name),
+                            ).props('unelevated').classes(
+                                'bg-slate-800 hover:bg-slate-900 text-white font-bold rounded-xl px-4 py-2 text-xs'
+                            )
+                            ui.button('Close', icon='close', on_click=dialog.close).props('flat').classes(
+                                'text-slate-600 font-bold'
+                            )
+                    # the payload is a self-generated base64 PDF, so the markup is
+                    # emitted verbatim instead of being stripped by the sanitiser
+                    ui.html(
+                        '<embed src="data:application/pdf;base64,' + encoded + '" type="application/pdf" '
+                        'style="width:100%;height:70vh;border:1px solid #E2E8F0;border-radius:12px"></embed>',
+                        sanitize=False,
+                    )
+                dialog.open()
+
+            with ui.row().classes(
+                'w-full items-center justify-between flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100'
+            ):
+                status_label = ui.label('').classes('text-[11px] font-semibold text-slate-500')
+                with ui.row().classes('gap-2 flex-wrap'):
+                    ui.button('Save FIR Details', icon='save', on_click=save_fir_details).props(
+                        'unelevated'
+                    ).classes(
+                        'bg-emerald-800 hover:bg-emerald-900 text-white font-bold rounded-xl px-5 py-2 text-xs'
+                    )
+                    ui.button(
+                        'Preview Draft FIR Document', icon='picture_as_pdf',
+                        on_click=preview_draft_document,
+                    ).props('outline no-caps').classes(
+                        'border-2 border-rose-700 text-rose-800 font-bold rounded-xl px-4 py-2 text-xs'
+                    )
+
+        @ui.refreshable
+        def record_summary() -> None:
+            record = get_complaint_for_verification(complaint['id']) or complaint
+            for column, element in fields.items():
+                stored = record.get(column) or ''
+                if element.value == snapshot[column] and stored != snapshot[column]:
+                    element.value = stored
+                    snapshot[column] = stored
+
             with ui.card().classes(
                 'flex-1 min-w-72 p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'
             ):
@@ -1107,19 +1252,20 @@ def fir_registration_page(complaint_id: str) -> None:
                         'text-base font-bold text-slate-900 fantasy-title'
                     )
                 for label, value in [
-                    ('Complaint Reference', complaint.get('reference') or 'Not recorded'),
-                    ('Citizen', complaint.get('citizen_name') or complaint.get('applicant_name') or 'Not recorded'),
-                    ('Mobile', complaint.get('citizen_phone') or 'Not recorded'),
-                    ('Category', complaint.get('category') or 'Not recorded'),
+                    ('Complaint Reference', record.get('reference') or 'Not recorded'),
+                    ('Citizen', record.get('citizen_name') or record.get('applicant_name') or 'Not recorded'),
+                    ('Citizen Username', record.get('citizen_username') or 'Not issued yet'),
+                    ('Mobile', record.get('citizen_phone') or 'Not recorded'),
+                    ('Category', record.get('category') or 'Not recorded'),
                     ('Incident Date / Time',
-                     f"{complaint.get('incident_date') or '—'} {complaint.get('incident_time') or ''}".strip()),
-                    ('Location', complaint.get('location') or 'Not recorded'),
+                     f"{record.get('incident_date') or '—'} {record.get('incident_time') or ''}".strip()),
+                    ('Location', record.get('location') or 'Not recorded'),
                     ('District / State',
-                     ', '.join(part for part in (complaint.get('district'), complaint.get('state')) if part)
+                     ', '.join(part for part in (record.get('district'), record.get('state')) if part)
                      or 'Not recorded'),
-                    ('Police Station', complaint.get('police_station') or 'Not recorded'),
-                    ('Verified By', complaint.get('verified_by_name') or 'Not recorded'),
-                    ('Verified At', _fmt(complaint.get('verified_at'))),
+                    ('Police Station', record.get('police_station') or 'Not recorded'),
+                    ('Verified By', record.get('verified_by_name') or 'Not recorded'),
+                    ('Verified At', _fmt(record.get('verified_at'))),
                 ]:
                     with ui.row().classes(
                         'w-full justify-between items-start gap-3 py-1.5 border-b border-slate-50'
@@ -1128,18 +1274,26 @@ def fir_registration_page(complaint_id: str) -> None:
                         ui.label(str(value)).classes(
                             'text-[11px] font-semibold text-slate-900 text-right break-words'
                         )
+                if record.get('fir_edited_at'):
+                    ui.label(
+                        f"Officer corrections saved by {record.get('fir_edited_by_name') or '—'} · "
+                        f"{_fmt(record.get('fir_edited_at'))}"
+                    ).classes('text-[10px] font-bold text-emerald-800 mt-2')
                 ui.label('Complaint Description').classes(
                     'text-[10px] font-bold text-slate-500 uppercase mt-3'
                 )
-                ui.label(complaint.get('description') or '—').classes(
+                ui.label(record.get('description') or '—').classes(
                     'text-xs text-slate-800 leading-relaxed whitespace-pre-line mt-1'
                 )
                 ui.label('Verification Remarks').classes(
                     'text-[10px] font-bold text-slate-500 uppercase mt-3'
                 )
-                ui.label(complaint.get('verification_remarks') or 'No remarks recorded.').classes(
+                ui.label(record.get('verification_remarks') or 'No remarks recorded.').classes(
                     'text-xs text-slate-700 leading-relaxed whitespace-pre-line'
                 )
+
+        with ui.row().classes('w-full gap-4 flex-wrap items-start'):
+            record_summary()
 
             with ui.column().classes('flex-1 min-w-72 gap-4'):
                 with ui.card().classes(
@@ -1279,6 +1433,11 @@ def fir_registration_page(complaint_id: str) -> None:
                         'px-6 py-3 text-sm shadow-md'
                     )
 
+        # Another desk can verify, edit or register this complaint while the page is
+        # open, so the record and the form follow the stored values without a reload.
+        _listen(record_summary, ('COMPLAINT_UPDATED', 'COMPLAINT_VERIFICATION_UPDATED'))
+        ui.timer(15.0, record_summary.refresh)
+
 
 # ==========================================
 # 5. FIR SCRUTINY, ASSIGNMENT & DOCUMENT
@@ -1361,7 +1520,7 @@ def open_edit_and_format_fir_dialog(fir_id: str, fir: dict, user: dict, on_succe
                     'Witness Information & Reference Documents', value=fir.get('witness_details', '')
                 ).classes('w-full').props('outlined rows=3')
                 e_reason = ui.input(
-                    'Scrutiny Audit Memo / Change Reason *',
+                    'Scrutiny Audit Memo / Change Reason (optional)',
                     value='Formatted structured FIR & verified incident parameters',
                 ).classes('w-full').props('outlined')
 
@@ -1369,9 +1528,7 @@ def open_edit_and_format_fir_dialog(fir_id: str, fir: dict, user: dict, on_succe
             if not e_loc.value or not e_desc.value:
                 ui.notify('Please provide location and description.', type='warning')
                 return
-            if not e_reason.value or not e_reason.value.strip():
-                ui.notify('Please specify a scrutiny audit memo reason.', type='warning')
-                return
+            reason = (e_reason.value or '').strip()
             updated_dict = {
                 'incident_type': e_type.value,
                 'status': e_status.value,
@@ -1386,7 +1543,7 @@ def open_edit_and_format_fir_dialog(fir_id: str, fir: dict, user: dict, on_succe
             try:
                 update_fir(
                     fir_id=fir_id, actor_user=user, updated_fields=updated_dict,
-                    change_reason=e_reason.value.strip(),
+                    change_reason=reason,
                 )
                 try:
                     log_officer_activity(
@@ -1395,7 +1552,7 @@ def open_edit_and_format_fir_dialog(fir_id: str, fir: dict, user: dict, on_succe
                         status_from=fir.get('status'),
                         status_to=updated_dict.get('status', fir.get('status')),
                         details=f"Verification Officer {user.get('name')} edited and structured FIR. "
-                                f"Reason: {e_reason.value.strip()}",
+                                f"Reason: {reason or 'Not provided'}",
                     )
                 except Exception:
                     pass
@@ -1732,9 +1889,6 @@ def verification_fir_detail_page(fir_id: str) -> None:
                             f"Generated by {current_doc.get('generated_by_name') or '—'} · "
                             f"{_fmt(current_doc.get('generated_at'))}"
                         ).classes('text-[10px] text-slate-500')
-                        ui.label(
-                            f"SHA-256 {str(current_doc.get('sha256') or '')[:24]}…"
-                        ).classes('text-[9px] text-slate-400 font-mono break-all')
                         with ui.row().classes('gap-2 mt-3 flex-wrap'):
                             def download_pdf() -> None:
                                 data = read_document_bytes(current_doc)

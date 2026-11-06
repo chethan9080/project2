@@ -22,18 +22,18 @@ def get_active_drawer(client_id: str) -> Optional[Any]:
 PORTAL_LINKS = {
     'citizen': [
         ('Dashboard', 'dashboard', '/citizen'),
-        ('File an FIR', 'add_circle', '/citizen/submit'),
-        ('My Complaints', 'report_problem', '/citizen/complaints'),
-        ('FIR Tracking', 'track_changes', '/citizen/tracking'),
-        ('Chat with Officer', 'chat', '/citizen/chat'),
+        ('File a Complaint / FIR', 'add_circle', '/citizen/submit'),
+        ('My Complaints / FIRs', 'report_problem', '/citizen/complaints'),
+        ('Live FIR Tracking', 'track_changes', '/citizen/tracking'),
         ('Notifications', 'notifications', '/citizen/notifications'),
+        ('Chat with Police Officer', 'chat', '/citizen/chat'),
         ('Profile', 'person', '/citizen/profile'),
         ('Logout', 'logout', '/login')
     ],
     'police': [
         ('Dashboard', 'dashboard', '/police'),
+        ('Assigned FIRs', 'folder_special', '/police/firs'),
         ('Assigned Complaints', 'report_problem', '/police/complaints'),
-        ('My Assigned Cases', 'folder_special', '/police/firs'),
         ('Chat with Citizens', 'forum', '/police/chat'),
         ('Notifications', 'notifications', '/police/notifications'),
         ('Profile', 'person', '/police/profile'),
@@ -42,21 +42,19 @@ PORTAL_LINKS = {
     'verification': [
         ('Dashboard', 'dashboard', '/verification'),
         ('Citizen Verification', 'how_to_reg', '/verification/citizens'),
-        ('Verify Queries', 'fact_check', '/verification/complaints'),
-        ('Verify Your FIR', 'description', '/verification/firs'),
-        ('Verification History', 'history', '/verification/history'),
+        ('FIR Verification', 'fact_check', '/verification/complaints'),
+        ('Police Assignment', 'assignment_ind', '/verification/assignments'),
         ('Notifications', 'notifications', '/verification/notifications'),
         ('Profile', 'person', '/verification/profile'),
         ('Logout', 'logout', '/staff-portal')
     ],
     'admin': [
-        ('Dashboard', 'dashboard', '/admin'),
-        ('Authorized Officers', 'badge', '/admin/officers'),
-        ('Blockchain Ledger', 'toll', '/admin/blockchain'),
-        ('Case Assignments', 'assignment_ind', '/admin/assignments'),
-        ('Investigation Monitor', 'monitoring', '/admin/investigations'),
-        ('System Audit Logs', 'history', '/admin/audit-logs'),
-        ('FIR Tampering & Audit', 'policy', '/admin/tampering-audit'),
+        ('Overview', 'dashboard', '/admin'),
+        ('Citizen Records', 'groups', '/admin/citizens'),
+        ('Police Officer Verification', 'badge', '/admin/officers'),
+        ('FIR Cases', 'policy', '/admin/fir-cases'),
+        ('Notifications', 'notifications', '/admin/notifications'),
+        ('Audit / Blockchain Records', 'toll', '/admin/audit-logs'),
         ('Profile', 'person', '/admin/profile'),
         ('Logout', 'logout', '/staff-portal')
     ],

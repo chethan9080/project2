@@ -33,8 +33,13 @@ def _deliver(queue: asyncio.Queue, event: Dict[str, Any]) -> None:
     try:
         queue.put_nowait(event)
     except asyncio.QueueFull:
-        # A stalled client must never block or crash the publishing request.
-        pass
+        # A stalled client must never block or crash the publishing request. Drop the
+        # oldest queued event instead of the new one so pages converge on current state.
+        try:
+            queue.get_nowait()
+            queue.put_nowait(event)
+        except asyncio.QueueEmpty:
+            pass
 
 
 def publish(event: Dict[str, Any]) -> None:

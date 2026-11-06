@@ -34,6 +34,7 @@ ACTION_LABELS = {
     'ADDITIONAL_INFO_REQUESTED': 'Additional Information Requested',
     'REMARK': 'Internal Verification Remark',
     'OFFICER_ASSIGNED': 'Investigating Officer Assigned',
+    'FIR_DETAILS_EDITED': 'FIR Details Edited Before Registration',
 }
 
 
@@ -55,6 +56,7 @@ def _complaint_rows(where: str = '', params: tuple = (), limit: Optional[int] = 
     query = f"""
         SELECT c.*,
                u.name AS citizen_name, u.phone AS citizen_phone, u.email AS citizen_email,
+               u.username AS citizen_username,
                o.name AS officer_name_from_user, o.badge_number AS officer_badge,
                o.rank AS officer_rank, o.station AS officer_station, o.phone AS officer_phone,
                f.fir_number AS fir_number, f.status AS fir_status
@@ -251,6 +253,124 @@ def record_complaint_verification_action(
         'verification_status': verification_to,
     })
     return updated
+
+
+FIR_DETAIL_LABELS = {
+    'category': 'Offence category',
+    'description': 'Complaint description',
+    'location': 'Place of occurrence',
+    'landmark': 'Landmark',
+    'area': 'Area',
+    'district': 'District',
+    'state': 'State / UT',
+    'police_station': 'Police station',
+    'incident_date': 'Incident date',
+    'incident_time': 'Incident time',
+    'accused_details': 'Accused / suspect details',
+    'witness_details': 'Witness details',
+}
+
+FIR_DETAIL_FIELDS = tuple(FIR_DETAIL_LABELS)
+FIR_DETAIL_REQUIRED = ('category', 'description', 'location')
+FIR_DETAIL_MAX_LENGTH = 2000
+
+
+def update_fir_details_before_registration(
+    complaint_id: str,
+    fields: Dict[str, Any],
+    actor_user: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Store the officer's review corrections; FIR registration inherits them."""
+    role = (actor_user or {}).get('role')
+    if role not in REVIEWER_ROLES:
+        raise PermissionError('Only Verification Officers or Administrators may edit FIR details before registration.')
+
+    updates: Dict[str, str] = {}
+    for column in FIR_DETAIL_FIELDS:
+        if column not in (fields or {}):
+            continue
+        value = str(fields[column] if fields[column] is not None else '').strip()
+        if len(value) > FIR_DETAIL_MAX_LENGTH:
+            raise ValueError(f'{FIR_DETAIL_LABELS[column]} must be {FIR_DETAIL_MAX_LENGTH} characters or fewer.')
+        if not value and column in FIR_DETAIL_REQUIRED:
+            raise ValueError(f'{FIR_DETAIL_LABELS[column]} is required on the FIR record.')
+        updates[column] = value
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise ValueError('Complaint not found.')
+    complaint = dict(row)
+
+    if complaint.get('fir_id'):
+        conn.close()
+        raise ValueError('This complaint is already registered as an FIR. Amend the registered FIR instead.')
+    if (complaint.get('status') or '') in ('REJECTED', 'CLOSED', 'RESOLVED'):
+        conn.close()
+        raise ValueError('This complaint is closed and can no longer be edited.')
+
+    changed = [
+        column for column in FIR_DETAIL_FIELDS
+        if column in updates and updates[column] != (complaint.get(column) or '')
+    ]
+    now = _now()
+    actor_name = actor_user.get('name') or 'Verification Officer'
+
+    if changed:
+        assignments = ', '.join(f'{column} = ?' for column in changed)
+        params = [updates[column] for column in changed]
+        params += [actor_user.get('id'), actor_name, now, now, complaint_id]
+        cursor.execute(
+            f"UPDATE complaints SET {assignments}, fir_edited_by = ?, fir_edited_by_name = ?, "
+            "fir_edited_at = ?, updated_at = ? WHERE id = ?",
+            params,
+        )
+        labels = ', '.join(FIR_DETAIL_LABELS[column] for column in changed)
+        cursor.execute("""
+            INSERT INTO complaint_verification_events (
+                id, complaint_id, action, status_from, status_to, remarks,
+                actor_id, actor_name, actor_role, actor_badge, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            f"cve-{uuid.uuid4().hex[:12]}", complaint_id, 'FIR_DETAILS_EDITED',
+            complaint.get('status'), complaint.get('status'),
+            f'Pre-registration FIR details updated: {labels}',
+            actor_user.get('id'), actor_name, role, actor_user.get('badge_number') or 'N/A', now,
+        ))
+        conn.commit()
+
+    conn.close()
+    updated = _complaint_rows("WHERE c.id = ?", (complaint_id,), limit=1)
+
+    if changed:
+        from backend.services.notification_service import notify_role
+
+        role_title = role.replace('_', ' ').title()
+        notify_role(
+            'ADMIN',
+            'FIR Details Edited Before Registration',
+            (f"Complaint {complaint.get('reference')}: {role_title} {actor_name} updated "
+             f"{labels} before FIR registration."),
+            f"fir-details-edit-{complaint_id}-{now}",
+            complaint_id=complaint_id,
+            notification_type='FIR_UPDATE',
+            severity='INFO',
+            exclude_user_id=actor_user.get('id'),
+        )
+        publish({
+            'type': 'COMPLAINT_UPDATED',
+            'complaint_id': complaint_id,
+            'citizen_id': complaint.get('citizen_id'),
+            'status': complaint.get('status'),
+            'verification_status': complaint.get('verification_status'),
+            'action': 'FIR_DETAILS_EDITED',
+            'timestamp': now,
+        })
+
+    return updated[0] if updated else complaint
 
 
 def _notify_citizen_complaint_action(complaint: Dict[str, Any], action: str, remarks: str,

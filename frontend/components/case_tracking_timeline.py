@@ -282,8 +282,8 @@ def render_live_fir_timeline(
                                         ui.icon('badge', size='xs').classes('text-blue-700')
                                         ui.label(f"Assigned / Updated by: {st_item['officer_info']}").classes('font-bold text-slate-800')
 
-                                # Prominent Red Alert if this stage is under alert
-                                if alerts_for_st:
+                                # Prominent Red Alert if this stage is under alert (staff only)
+                                if alerts_for_st and is_officer:
                                     for al in alerts_for_st:
                                         with ui.card().classes('w-full mt-3 p-3 bg-red-100 border border-red-400 rounded-xl text-red-950'):
                                             with ui.row().classes('items-center gap-2'):

@@ -282,7 +282,7 @@ class TestBlockchainFIRPlatform(unittest.TestCase):
         2. Citizen notification does NOT expose OLD/NEW values, reasons, officer badge, hashes.
         3. Citizen is FORBIDDEN from accessing detailed change history (raises PermissionError / 403).
         4. Unauthorized police officer is FORBIDDEN from accessing audit history (raises PermissionError / 403).
-        5. Authorized police officer CAN access full forensic audit details.
+        5. Only the Authorized Officer (ADMIN) CAN access full forensic audit details.
         """
         citizen = authenticate_user("citizen@example.com", TEST_PASSWORD)
         assigned_officer = authenticate_user("officer@example.com", TEST_PASSWORD)
@@ -360,9 +360,19 @@ class TestBlockchainFIRPlatform(unittest.TestCase):
         with self.assertRaises(PermissionError):
             get_fir_versions(fir_id, actor_user=other_officer)
 
-        # 6. Verify Authorized Officer CAN access full detailed forensic audit
-        self.assertTrue(can_user_access_fir_audit(assigned_officer, fir))
-        audit_events = get_fir_changes(fir_id, actor_user=assigned_officer)
+        # 6. The assigned police officer is FORBIDDEN from forensic audit: hashes,
+        #    blockchain metadata and old/new diffs are Authorized-Officer-only.
+        self.assertFalse(can_user_access_fir_audit(assigned_officer, fir))
+        with self.assertRaises(PermissionError):
+            get_fir_changes(fir_id, actor_user=assigned_officer)
+
+        with self.assertRaises(PermissionError):
+            get_fir_versions(fir_id, actor_user=assigned_officer)
+
+        # 7. Only the Authorized Officer (ADMIN) sees the complete forensic audit
+        admin = authenticate_user("admin@example.com", TEST_PASSWORD)
+        self.assertTrue(can_user_access_fir_audit(admin, fir))
+        audit_events = get_fir_changes(fir_id, actor_user=admin)
         self.assertEqual(len(audit_events), 1)
 
         evt = audit_events[0]

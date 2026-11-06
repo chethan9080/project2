@@ -12,7 +12,7 @@ import json
 
 from nicegui import background_tasks, ui
 
-from backend.services.auth_service import get_current_user
+from backend.services.auth_service import get_current_user, get_staff_access_issue, set_current_user
 from backend.services.complaint_evidence_service import (
     ALLOWED_EXTENSIONS,
     MAX_FILE_BYTES,
@@ -94,9 +94,13 @@ STAGE_COLOURS = {
 
 
 def require_police_user():
-    """Ensure the active session belongs to a police officer or administrator."""
+    """Ensure the active session belongs to an active police officer or administrator."""
     user = get_current_user() or {}
     if not user or user.get("role") not in ("OFFICER", "ADMIN"):
+        ui.navigate.to('/staff-portal')
+        return None
+    if get_staff_access_issue(user):
+        set_current_user(None)
         ui.navigate.to('/staff-portal')
         return None
     return user
@@ -165,11 +169,15 @@ def _case_identity(
     fir_number,
     citizen_name,
     complaint_reference=None,
+    citizen_username=None,
     size: str = 'text-lg',
 ) -> None:
     """FIR number with the citizen's name directly below it, everywhere one is shown."""
     ui.label(f"FIR No: {fir_number or '—'}").classes(f'{size} font-black text-slate-900 font-mono leading-tight')
-    ui.label(f"Citizen: {citizen_name or 'Not recorded'}").classes('text-[11px] font-bold text-blue-800')
+    name_tag = f"{citizen_name or 'Not recorded'}"
+    if citizen_username:
+        name_tag += f"  (@{citizen_username})"
+    ui.label(f"Citizen: {name_tag}").classes('text-[11px] font-bold text-blue-800')
     if complaint_reference:
         ui.label(f"Complaint Ref: {complaint_reference}").classes('text-[10px] text-slate-500 font-mono')
 
@@ -236,7 +244,7 @@ def open_edit_fir_dialog(fir_id: str, fir: dict, user: dict, on_success_callback
             e_accused = ui.textarea('Accused / Suspect Details', value=fir.get('accused_details', '')).classes('w-full').props('outlined rows=3')
             e_witness = ui.textarea('Witness Statements & Evidence References', value=fir.get('witness_details', '')).classes('w-full').props('outlined rows=3')
             e_reason = ui.input(
-                'Reason for Change / Case Update Memo *',
+                'Reason for Change / Case Update Memo (optional)',
                 placeholder='E.g., statement recorded, new evidence added, suspect identified...',
             ).classes('w-full mt-2').props('outlined')
             ui.label(
@@ -247,9 +255,6 @@ def open_edit_fir_dialog(fir_id: str, fir: dict, user: dict, on_success_callback
             def save_fir_updates():
                 if not e_loc.value or not e_desc.value:
                     ui.notify('Please fill in location and description.', type='warning')
-                    return
-                if not (e_reason.value or '').strip():
-                    ui.notify('Please state a reason for this update.', type='warning')
                     return
 
                 updated_dict = {
@@ -514,7 +519,9 @@ def police_assigned_cases_page() -> None:
                                 with ui.row().classes('items-center gap-2 flex-wrap'):
                                     _case_identity(
                                         case.get('fir_number'), case.get('citizen_name'),
-                                        case.get('complaint_reference'), size='text-base',
+                                        case.get('complaint_reference'),
+                                        citizen_username=case.get('citizen_username'),
+                                        size='text-base',
                                     )
                                     ui.badge(case.get('status') or '').classes(
                                         f'{_status_class(case.get("status"))} border font-bold text-[10px] px-2 rounded-full'
@@ -624,6 +631,7 @@ def police_fir_case_page(fir_id: str) -> None:
                             _case_identity(
                                 fresh.get('fir_number'), fresh.get('citizen_name'),
                                 fresh.get('reference_number') and f"Tracking Ref {fresh.get('reference_number')}",
+                                citizen_username=fresh.get('citizen_username'),
                                 size='text-2xl md:text-3xl',
                             )
                             ui.label(f"Version v{fresh.get('current_version', 1)} · Opened {_fmt(fresh.get('created_at'))}").classes(
@@ -650,10 +658,13 @@ def police_fir_case_page(fir_id: str) -> None:
                     with ui.row().classes('w-full gap-6 flex-wrap text-xs'):
                         for label, value in [
                             ('Full Name', fresh.get('citizen_name') or 'Not recorded'),
+                            ('Username', f"@{fresh.get('citizen_username')}" if fresh.get('citizen_username') else 'Not recorded'),
                             ('Mobile Contact', fresh.get('citizen_phone') or 'Not recorded'),
                             ('Email Address', fresh.get('citizen_email') or 'Not recorded'),
                             ('Address', fresh.get('citizen_address') or 'Not recorded'),
                             ('Government ID', fresh.get('gov_id_masked') or 'Not recorded'),
+                            ('FIR Registration Date', _fmt(fresh.get('created_at'))),
+                            ('Officer Assignment Date', _fmt(fresh.get('assigned_at'))),
                         ]:
                             with ui.column().classes('min-w-40 gap-0.5'):
                                 ui.label(label).classes('font-bold text-slate-500 text-[10px] uppercase')
@@ -711,9 +722,6 @@ def police_fir_case_page(fir_id: str) -> None:
                                 f"Citizen: {fresh.get('citizen_name') or 'Not recorded'} · "
                                 f"Generated by {current_doc.get('generated_by_name') or '—'} · {_fmt(current_doc.get('generated_at'))}"
                             ).classes('text-[10px] text-slate-500')
-                            ui.label(f"SHA-256 {str(current_doc.get('sha256') or '')[:24]}…").classes(
-                                'text-[9px] text-slate-400 font-mono'
-                            )
                         with ui.row().classes('gap-2 flex-wrap'):
                             def view_draft():
                                 data = read_document_bytes(current_doc)
@@ -758,6 +766,17 @@ def police_fir_case_page(fir_id: str) -> None:
                     except (TypeError, ValueError):
                         complaint_files = []
 
+                # Also check evidence attached directly to the FIR record
+                if not complaint_files:
+                    try:
+                        complaint_files = json.loads(fresh.get('evidence_files') or '[]')
+                    except (TypeError, ValueError):
+                        complaint_files = []
+
+                # Resolve the complaint id safely — the complaint row may be None when
+                # the FIR was created without a linked complaint record.
+                _complaint_id = (complaint.get('id') if complaint else None) or fresh.get('complaint_id')
+
                 if complaint_files:
                     for item in complaint_files:
                         with ui.row().classes('w-full items-center justify-between gap-3 p-2.5 rounded-xl border border-slate-200 bg-slate-50/70'):
@@ -771,11 +790,14 @@ def police_fir_case_page(fir_id: str) -> None:
                                     ).classes('text-[10px] font-bold text-emerald-700')
                                 else:
                                     ui.label(
-                                        f"Filed by complainant {(complaint.get('citizen_name') or fresh.get('citizen_name') or 'Citizen')} · "
+                                        f"Filed by complainant {(complaint.get('citizen_name') if complaint else None) or fresh.get('citizen_name') or 'Citizen'} · "
                                         f"{int(item.get('size') or 0) // 1024} KB"
                                     ).classes('text-[10px] text-slate-500')
 
-                            def open_complaint_file(entry=item, cid=complaint['id']):
+                            def open_complaint_file(entry=item, cid=_complaint_id):
+                                if not cid:
+                                    ui.notify('No complaint record linked to this FIR.', type='warning')
+                                    return
                                 data = evidence_bytes(cid, entry.get('stored_name') or '')
                                 if not data:
                                     ui.notify('The stored file is no longer available.', type='warning')
@@ -1092,8 +1114,7 @@ def police_fir_case_page(fir_id: str) -> None:
                                             ).classes('text-[9px] text-slate-500 font-mono')
                                             if entry.get('file_name'):
                                                 ui.label(
-                                                    f"{entry['file_name']} · {int(entry.get('file_size') or 0) // 1024} KB · "
-                                                    f"SHA-256 {str(entry.get('sha256') or '')[:16]}…"
+                                                    f"{entry['file_name']} · {int(entry.get('file_size') or 0) // 1024} KB"
                                                 ).classes('text-[9px] text-slate-500 font-mono')
 
                                     with ui.row().classes('items-center gap-2'):

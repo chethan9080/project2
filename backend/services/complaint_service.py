@@ -193,30 +193,27 @@ def create_complaint(citizen_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _notify_verification_officers(complaint: Dict[str, Any]) -> None:
-    """Alert every active Verification Officer about a newly submitted complaint."""
+    """Alert every active Verification Officer — and the Authorized Officer desk —
+    about a newly submitted complaint."""
     try:
-        from backend.services.notification_service import create_notification
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id FROM users WHERE role = 'VERIFICATION_OFFICER' AND status = 'ACTIVE'"
+        from backend.services.notification_service import notify_role
+        message = (
+            f"{complaint.get('applicant_name') or complaint.get('citizen_name') or 'A citizen'} "
+            f"submitted complaint {complaint.get('reference')} "
+            f"({complaint.get('category')})."
         )
-        officer_ids = [row['id'] for row in cursor.fetchall()]
-        conn.close()
-        for officer_id in officer_ids:
-            create_notification(
-                user_id=officer_id,
-                complaint_id=complaint.get('id'),
-                title="New Complaint Awaiting Verification",
-                message=(
-                    f"{complaint.get('applicant_name') or complaint.get('citizen_name') or 'A citizen'} "
-                    f"submitted complaint {complaint.get('reference')} "
-                    f"({complaint.get('category')})."
-                ),
-                notification_type="COMPLAINT_SUBMITTED",
-                severity="INFO",
-                event_id=f"complaint-verification-{complaint.get('id')}",
-            )
+        notify_role(
+            'VERIFICATION_OFFICER', 'New Complaint Awaiting Verification', message,
+            f"complaint-verification-{complaint.get('id')}",
+            complaint_id=complaint.get('id'),
+            notification_type='COMPLAINT_SUBMITTED', severity='INFO',
+        )
+        notify_role(
+            'ADMIN', 'New Complaint Submitted', message,
+            f"complaint-submission-audit-{complaint.get('id')}",
+            complaint_id=complaint.get('id'),
+            notification_type='COMPLAINT_SUBMITTED', severity='INFO',
+        )
     except Exception as exc:
         print(f"Verification officer notification error: {exc}")
 
@@ -227,7 +224,7 @@ def get_complaint_by_id(complaint_id: str, citizen_id: Optional[str] = None, act
     cursor = conn.cursor()
     cursor.execute("""
         SELECT c.*,
-               u.name AS citizen_name, u.phone AS citizen_phone, u.email AS citizen_email,
+               u.name AS citizen_name, u.username AS citizen_username, u.phone AS citizen_phone, u.email AS citizen_email,
                o.name AS officer_name_from_user, o.badge_number AS officer_badge,
                o.rank AS officer_rank, o.station AS officer_station, o.phone AS officer_phone,
                f.fir_number AS fir_number, f.status AS fir_status,
@@ -303,7 +300,7 @@ def get_all_complaints(actor_user: Optional[Dict] = None) -> List[Dict[str, Any]
     cursor = conn.cursor()
     cursor.execute("""
         SELECT c.*,
-               u.name AS citizen_name, u.phone AS citizen_phone, u.email AS citizen_email,
+               u.name AS citizen_name, u.username AS citizen_username, u.phone AS citizen_phone, u.email AS citizen_email,
                o.name AS officer_name_from_user, o.badge_number AS officer_badge,
                o.rank AS officer_rank, o.station AS officer_station, o.phone AS officer_phone,
                f.fir_number AS fir_number, f.status AS fir_status
@@ -429,6 +426,20 @@ def update_complaint_status(complaint_id: str, new_status: str, actor_user: Dict
     complaint = get_complaint_by_id(complaint_id)
     if not complaint:
         return False
+
+    current_status = (complaint.get('status') or '').upper()
+    if new_status in ('VERIFIED', 'FIR_CREATED') and current_status != new_status:
+        # The complaint verification workflow records the verifying officer, the
+        # verification event and the citizen alert; a status edit must not fork it.
+        raise ValueError(
+            f'{new_status.replace("_", " ").title()} is recorded by the complaint '
+            'verification workflow, not by a status edit.'
+        )
+
+    if current_status == new_status and not (new_status == 'REJECTED' and reason):
+        # Re-saving the stage the complaint already sits at must not alert the
+        # citizen a second time.
+        return True
 
     conn = get_db_connection()
     now = _now()

@@ -473,12 +473,16 @@ def _record_in_app_notification(
             'use the secure activation option or contact support.'
         )
 
+    base_msg = (
+        f"Your account has been verified successfully. Your username is {credentials['username']}. "
+        "Please set your password using the secure activation link and log in to access your citizen dashboard."
+    )
+    full_msg = f"{base_msg} {closing}".strip()
+
     create_notification(
         user_id=citizen_id,
         title='Your Citizen Account Has Been Verified',
-        message=(
-            f"Your registration has been verified. Your username: {credentials['username']}. {closing}"
-        ),
+        message=full_msg,
         notification_type='CITIZEN_CREDENTIALS',
         severity='SUCCESS' if status == SENT else 'WARNING',
         event_id=f"citizen-credentials-{credentials['id']}-attempt-{credentials['delivery_attempts'] + 1}",

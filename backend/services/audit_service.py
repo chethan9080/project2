@@ -21,15 +21,13 @@ AUTHORIZED_OFFICER_RANKS = (
 
 
 def is_authorized_for_audit(actor_user: Dict[str, Any]) -> bool:
-    """Return True if user is ADMIN or a senior-ranked police officer."""
-    if not actor_user:
-        return False
-    if actor_user.get('role') == 'ADMIN':
-        return True
-    if actor_user.get('role') == 'OFFICER':
-        rank = (actor_user.get('rank') or '').lower()
-        return any(r in rank for r in AUTHORIZED_OFFICER_RANKS)
-    return False
+    """
+    Return True only for the Authorized Officer (ADMIN).
+
+    Hash values, blockchain metadata and the technical audit trail stay hidden from
+    Verification Officers and Police Officers, whatever their rank.
+    """
+    return bool(actor_user) and actor_user.get('role') == 'ADMIN'
 
 
 def require_audit_access(actor_user: Dict[str, Any]) -> None:

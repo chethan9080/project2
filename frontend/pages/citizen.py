@@ -1217,6 +1217,9 @@ def citizen_notifications_page() -> None:
                                 ui.button(icon='mark_email_read', on_click=lambda nid=notif.get('id'): handle_read(nid)).props('flat round dense size=sm').classes('text-emerald-700').tooltip('Mark as read')
 
         notifications_body()
+        # Push events are dropped while a tab is reconnecting, so the inbox also
+        # re-reads the stored records periodically and cannot miss an update.
+        ui.timer(30.0, notifications_body.refresh)
 
         existing = get_user_notifications(user_id, limit=1)
         last_seen['id'] = existing[0].get('id') if existing else None

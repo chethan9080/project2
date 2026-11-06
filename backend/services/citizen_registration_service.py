@@ -218,39 +218,50 @@ def create_citizen_application(
         'timestamp': application['submitted_at'],
     })
     _notify_verification_officers(application)
+    _notify_citizen_submission(citizen_id, reference, application_id)
     return application
 
 
 def _notify_verification_officers(application: Dict[str, Any], update: bool = False) -> None:
-    """Deliver a real persistent notification to every active Verification Officer."""
+    """Deliver a real persistent notification to every active Verification Officer,
+    plus the matching audit alert to the Authorized Officer desk."""
     try:
-        from backend.services.notification_service import create_notification
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id FROM users WHERE role = 'VERIFICATION_OFFICER' AND status = 'ACTIVE'"
+        from backend.services.notification_service import notify_role
+        title = 'Additional Information Received' if update else 'New Citizen Registration'
+        verb = 'resubmitted information for' if update else 'submitted'
+        message = (
+            f"{application.get('full_name')} {verb}"
+            f" registration application {application.get('reference')}."
         )
-        officer_ids = [row['id'] for row in cursor.fetchall()]
-        conn.close()
-        for officer_id in officer_ids:
-            create_notification(
-                user_id=officer_id,
-                title=(
-                    'Additional Information Received' if update else 'New Citizen Registration'
-                ),
-                message=(
-                    f"{application.get('full_name')} "
-                    + ('resubmitted information for' if update else 'submitted')
-                    + f" registration application {application.get('reference')}."
-                ),
-                notification_type='CITIZEN_REGISTRATION',
-                severity='INFO',
-                event_id=(
-                    f"citizen-registration-{application['id']}-{application.get('updated_at')}"
-                ),
-            )
+        event_id = f"citizen-registration-{application['id']}-{application.get('updated_at')}"
+        notification_type = 'CITIZEN_REGISTRATION'
+        notify_role('VERIFICATION_OFFICER', title, message, event_id,
+                    notification_type=notification_type, severity='INFO')
+        notify_role('ADMIN', title, message, event_id,
+                    notification_type=notification_type, severity='INFO')
     except Exception as exc:
         print(f"Citizen registration notification error: {exc}")
+
+
+def _notify_citizen_submission(citizen_id: str, reference: str, application_id: str) -> None:
+    """Create an in-app notification for the citizen confirming their registration
+    was received and is pending verification."""
+    try:
+        from backend.services.notification_service import create_notification
+        create_notification(
+            user_id=citizen_id,
+            title='Registration Submitted — Verification Pending',
+            message=(
+                f"Your registration application ({reference}) has been submitted successfully. "
+                "It is now under review by a Verification Officer. "
+                "You will be notified once your account is verified and activated."
+            ),
+            notification_type='CITIZEN_REGISTRATION',
+            severity='INFO',
+            event_id=f"citizen-registration-submitted-{application_id}",
+        )
+    except Exception as exc:
+        print(f"Citizen submission self-notification error: {exc}")
 
 
 def get_citizen_application(application_id: str) -> Optional[Dict[str, Any]]:
@@ -615,6 +626,24 @@ def record_application_action(
             )
         except Exception as exc:
             print(f"Citizen application notification error: {exc}")
+
+        try:
+            from backend.services.notification_service import notify_role
+            notify_role(
+                'ADMIN',
+                f"Citizen Registration {status_label(status_to)}",
+                (
+                    f"{application.get('full_name')} ({application['reference']}) was "
+                    f"{status_label(status_to).lower()} by {actor_role.replace('_', ' ').title()} "
+                    f"{reviewer_name}."
+                ),
+                f"citizen-application-audit-{event_action}-{application_id}-{now}",
+                notification_type='CITIZEN_VERIFICATION',
+                severity='SUCCESS' if action == 'APPROVE' else 'WARNING',
+                exclude_user_id=actor_user.get('id'),
+            )
+        except Exception as exc:
+            print(f"Citizen verification audit notification error: {exc}")
 
         publish({
             'type': 'CITIZEN_APPLICATION_UPDATED',

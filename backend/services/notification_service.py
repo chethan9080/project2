@@ -76,6 +76,53 @@ def create_notification(
     return payload
 
 
+def get_active_user_ids(role: str, exclude: Optional[str] = None) -> List[str]:
+    """IDs of every ACTIVE account holding ``role``; a portal may be staffed by several officers."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM users WHERE role = ? AND status = 'ACTIVE' ORDER BY created_at", (role,)
+    )
+    ids = [row["id"] for row in cursor.fetchall()]
+    conn.close()
+    return [user_id for user_id in ids if user_id != exclude]
+
+
+def notify_role(
+    role: str,
+    title: str,
+    message: str,
+    event_id: str,
+    *,
+    fir_id: Optional[str] = None,
+    complaint_id: Optional[str] = None,
+    notification_type: str = "SYSTEM_UPDATE",
+    severity: str = "INFO",
+    exclude_user_id: Optional[str] = None,
+) -> List[str]:
+    """Deliver one alert to every active account in a role.
+
+    ``event_id`` is the underlying database event, so re-running a workflow step
+    never produces a second copy for the same recipient. The actor who performed
+    the action is excluded when ``exclude_user_id`` is given: an officer does not
+    need an alert about the edit they just made themselves.
+    """
+    delivered = []
+    for user_id in get_active_user_ids(role, exclude=exclude_user_id):
+        create_notification(
+            user_id=user_id,
+            fir_id=fir_id,
+            complaint_id=complaint_id,
+            title=title,
+            message=message,
+            notification_type=notification_type,
+            severity=severity,
+            event_id=f"{event_id}-{user_id}",
+        )
+        delivered.append(user_id)
+    return delivered
+
+
 def get_user_notifications(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     """Retrieve all notifications for a specific user."""
     conn = get_db_connection()

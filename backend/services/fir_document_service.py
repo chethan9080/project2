@@ -41,12 +41,23 @@ SECURE_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..', 'data', 'secure_uploads', 'fir_documents'
 ))
 DOCUMENT_TYPE = 'FIR_PDF'
-GENERATOR_ROLES = ('VERIFICATION_OFFICER', 'ADMIN')
+# Roles allowed to generate the official registered FIR PDF.  An assigned
+# Police Officer is included so their portal always has a downloadable copy
+# even when the VO hasn't regenerated after a force-update.
+GENERATOR_ROLES = ('VERIFICATION_OFFICER', 'ADMIN', 'OFFICER')
+# Roles allowed to render a *pre-registration draft preview* only (VO and Admin).
+_DRAFT_PREVIEW_ROLES = ('VERIFICATION_OFFICER', 'ADMIN')
 
 DRAFT_NOTICE = (
     'DRAFT FOR AUTHORISED APPROVAL — System-generated from the registered FIR record. '
     'Case-specific legal sections, officer signature and station seal must be completed '
     'and approved by the authorised Station House Officer.'
+)
+
+PRE_REGISTRATION_NOTICE = (
+    'PRE-REGISTRATION DRAFT — compiled from the verified complaint for officer review. '
+    'It carries no FIR number, is not issued to the citizen and becomes an official FIR '
+    'document only after registration.'
 )
 
 
@@ -241,10 +252,12 @@ def _field_table(rows: List[Tuple[str, str]], styles: Dict[str, ParagraphStyle])
     return table
 
 
-def _build_pdf(fir: Dict[str, Any], actor_user: Dict[str, Any]) -> bytes:
+def _build_pdf(fir: Dict[str, Any], actor_user: Dict[str, Any],
+               notice: Optional[str] = None) -> bytes:
     from io import BytesIO
 
     styles = _styles()
+    notice = notice or DRAFT_NOTICE
     buffer = BytesIO()
     fir_number = _display(fir.get('fir_number'), 'UNREGISTERED')
     station = _display(fir.get('police_station'), 'Police station not recorded')
@@ -261,7 +274,7 @@ def _build_pdf(fir: Dict[str, Any], actor_user: Dict[str, Any]) -> bytes:
         canvas.drawRightString(A4[0] - 18 * mm, A4[1] - 14 * mm, f"{fir_number} · {station}")
         canvas.setFont('Helvetica', 7)
         canvas.setFillColor(colors.HexColor('#64748B'))
-        canvas.drawString(18 * mm, 12 * mm, DRAFT_NOTICE[:150])
+        canvas.drawString(18 * mm, 12 * mm, notice[:150])
         canvas.drawRightString(A4[0] - 18 * mm, 12 * mm, f"Page {doc.page}")
         canvas.restoreState()
 
@@ -386,13 +399,17 @@ def _build_pdf(fir: Dict[str, Any], actor_user: Dict[str, Any]) -> bytes:
 def generate_fir_pdf(fir_id: str, actor_user: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
     """Generate and register the FIR PDF; reuse the current version unless forced."""
     if not actor_user or actor_user.get('role') not in GENERATOR_ROLES:
-        raise PermissionError('Only Verification Officers or Administrators may generate FIR documents.')
+        raise PermissionError('Only Verification Officers, Administrators or assigned Police Officers may generate FIR documents.')
 
     fir = _load_fir(fir_id)
     if not fir:
         raise ValueError('FIR not found.')
     if not fir.get('fir_number'):
         raise ValueError('The FIR has no registered number yet.')
+
+    # An OFFICER is only allowed to (re-)generate the PDF for their own assigned case.
+    if actor_user.get('role') == 'OFFICER' and fir.get('assigned_officer_id') != actor_user.get('id'):
+        raise PermissionError('You may only generate documents for FIRs assigned to you.')
 
     existing = get_current_document(fir_id)
     if not force and existing and resolve_document_file(existing.get('file_path')):
@@ -510,3 +527,92 @@ def latest_document_path_for(fir_id: str, user: Dict[str, Any]) -> Optional[Tupl
     if not path:
         return None
     return path, document.get('file_name') or f"{_safe_filename(fir.get('fir_number'))}.pdf"
+
+
+def document_path_for_version(fir_id: str, version: int, user: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Return (absolute path, download filename) for a specific document version."""
+    fir = _load_fir(fir_id)
+    if not can_view_fir_document(user, fir):
+        return None
+    docs = list_documents(fir_id)
+    target = next((d for d in docs if int(d.get('version', 0)) == int(version)), None)
+    if not target:
+        return None
+    path = resolve_document_file(target.get('file_path'))
+    if not path:
+        return None
+    return path, target.get('file_name') or f"{_safe_filename(fir.get('fir_number'))}_v{version}.pdf"
+
+
+def _load_complaint_for_draft(complaint_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT c.*,
+               u.name AS citizen_name, u.phone AS citizen_phone, u.email AS citizen_email,
+               u.address AS citizen_address, u.gov_id_masked,
+               o.name AS officer_name, o.rank AS officer_rank, o.badge_number AS officer_badge,
+               o.station AS officer_station, o.phone AS officer_phone
+        FROM complaints c
+        LEFT JOIN users u ON c.citizen_id = u.id
+        LEFT JOIN users o ON c.assigned_officer_id = o.id
+        WHERE c.id = ? OR c.reference = ?
+    """, (complaint_id, complaint_id))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def render_draft_document_for_complaint(
+    complaint_id: str,
+    actor_user: Dict[str, Any],
+) -> Tuple[bytes, str]:
+    """Render the FIR document a complaint would become, for review before registration.
+
+    Nothing is written: fir_documents belongs to registered FIRs, and a review preview
+    must not create an official document record or a citizen-facing notification.
+    """
+    if not actor_user or actor_user.get('role') not in _DRAFT_PREVIEW_ROLES:
+        raise PermissionError('Only Verification Officers or Administrators may generate FIR documents.')
+
+    complaint = _load_complaint_for_draft(complaint_id)
+    if not complaint:
+        raise ValueError('Complaint not found.')
+    if complaint.get('fir_id'):
+        raise ValueError('This complaint is already registered. Open the official FIR document instead.')
+
+    draft = {
+        'fir_number': None,
+        'status': 'PENDING REGISTRATION',
+        'created_at': None,
+        'complaint_reference': complaint.get('reference'),
+        'complaint_district': complaint.get('district'),
+        'complaint_state': complaint.get('state'),
+        'police_station': complaint.get('police_station'),
+        'incident_type': complaint.get('category'),
+        'incident_date': complaint.get('incident_date'),
+        'incident_time': complaint.get('incident_time'),
+        'incident_location': complaint.get('location'),
+        'landmark': complaint.get('landmark'),
+        'area': complaint.get('area'),
+        'description': complaint.get('description'),
+        'accused_details': complaint.get('accused_details'),
+        'witness_details': complaint.get('witness_details'),
+        'evidence_files': complaint.get('evidence_files'),
+        'verification_remarks': complaint.get('verification_remarks'),
+        'verified_by_name': complaint.get('verified_by_name'),
+        'verified_at': complaint.get('verified_at'),
+        'citizen_id': complaint.get('citizen_id'),
+        'citizen_name': complaint.get('citizen_name'),
+        'citizen_phone': complaint.get('citizen_phone'),
+        'citizen_email': complaint.get('citizen_email'),
+        'citizen_address': complaint.get('citizen_address'),
+        'gov_id_masked': complaint.get('gov_id_masked'),
+        'officer_name': complaint.get('officer_name'),
+        'officer_rank': complaint.get('officer_rank'),
+        'officer_badge': complaint.get('officer_badge'),
+        'officer_station': complaint.get('officer_station'),
+        'officer_phone': complaint.get('officer_phone'),
+    }
+    pdf_bytes = _build_pdf(draft, actor_user, PRE_REGISTRATION_NOTICE)
+    return pdf_bytes, f"DRAFT-{_safe_filename(complaint.get('reference'))}.pdf"

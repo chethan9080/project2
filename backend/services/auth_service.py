@@ -140,6 +140,26 @@ def get_citizen_access_issue(user: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def get_staff_access_issue(user: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the reason a staff session must not continue, if any.
+
+    The account is re-read from the database so an Authorized Officer decision to
+    suspend an officer, or to return the account to pending verification, takes
+    effect on the next request instead of only at the next sign-in.
+    """
+    if not user or user.get("role") == "CITIZEN":
+        return None
+    account = get_user_by_id(user.get("id"))
+    if not account:
+        return "This staff account no longer exists."
+    status = (account.get("status") or "").upper()
+    if status == "SUSPENDED":
+        return "This officer account is suspended. Contact the Authorized Officer desk."
+    if status != "ACTIVE":
+        return "This officer account is awaiting verification by the Authorized Officer."
+    return None
+
+
 def assert_active_citizen(user: Optional[Dict[str, Any]]) -> None:
     """Raise PermissionError unless the citizen is fully verified and approved."""
     if not user or user.get("role") != "CITIZEN":
@@ -242,13 +262,13 @@ def authenticate_user(email_or_phone_or_badge: str, password: str, required_role
     if not user:
         return None
 
-    if user.get("status") == "SUSPENDED":
-        return None
-
     if required_role and user.get("role") != required_role.upper():
         return None
 
-    if get_citizen_access_issue(user):
+    if user.get("role") == "CITIZEN":
+        if get_citizen_access_issue(user):
+            return None
+    elif get_staff_access_issue(user):
         return None
 
     user.pop("password_hash", None)
@@ -289,11 +309,17 @@ def get_current_user() -> Optional[Dict[str, Any]]:
 
 
 def get_session_user_strict() -> Optional[Dict[str, Any]]:
-    """Session-only user lookup for protected media endpoints (never uses global fallback)."""
+    """Session-only user lookup for protected endpoints (never uses global fallback).
+
+    A staff session is dropped as soon as the stored account stops being ACTIVE.
+    """
     storage = _session_storage()
     if storage is None:
         return None
-    return storage.get('current_user')
+    user = storage.get('current_user')
+    if user and get_staff_access_issue(user):
+        return None
+    return user
 
 
 def delete_unverified_citizen(user_id: str) -> None:
@@ -325,15 +351,112 @@ def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
 
 def get_all_officers() -> List[Dict[str, Any]]:
     """Retrieve list of all active police officers."""
+    return get_all_police_officers(status_filter='ACTIVE')
+
+
+def get_all_police_officers(status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retrieve police officers, with case metrics and optional status filtering."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, name, email, phone, badge_number, rank, station, district, status, role "
-        "FROM users WHERE role = 'OFFICER' AND status = 'ACTIVE' ORDER BY name"
-    )
+    query = """
+        SELECT u.id, u.name, u.email, u.phone, u.badge_number, u.rank, u.station, u.district,
+               u.status, u.role, u.created_at, u.updated_at, u.verification_status, u.verified_at,
+               (SELECT COUNT(*) FROM firs f WHERE f.assigned_officer_id = u.id AND f.status NOT IN ('CLOSED', 'RESOLVED', 'REJECTED')) AS active_cases_count,
+               (SELECT COUNT(*) FROM officer_assignments oa WHERE oa.officer_id = u.id) AS total_assignments_count
+        FROM users u
+        WHERE u.role = 'OFFICER'
+    """
+    params: List[Any] = []
+    if status_filter:
+        query += " AND u.status = ?"
+        params.append(status_filter.upper())
+    query += " ORDER BY u.name ASC"
+
+    cursor.execute(query, tuple(params))
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     return rows
+
+
+def update_officer_verification_status(
+    officer_id: str,
+    new_status: str,
+    admin_user: Dict[str, Any],
+    remarks: Optional[str] = None
+) -> Dict[str, Any]:
+    """Verify, activate, or suspend a Police Officer account (Authorized Officers / Admins only)."""
+    if not admin_user or admin_user.get("role") not in ("ADMIN", "AUTHORIZED_OFFICER"):
+        raise PermissionError("Only Authorized Officers / Administrators can verify police officer accounts.")
+
+    new_status = (new_status or "").strip().upper()
+    if new_status not in ('ACTIVE', 'PENDING_VERIFICATION', 'SUSPENDED'):
+        raise ValueError(f"Invalid officer status: {new_status}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ? AND role = 'OFFICER'", (officer_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"Police officer {officer_id} not found.")
+
+    officer = dict(row)
+    old_status = officer.get("status")
+    now = datetime.now(timezone.utc).isoformat()
+    ver_status = 'VERIFIED' if new_status == 'ACTIVE' else ('SUSPENDED' if new_status == 'SUSPENDED' else 'PENDING')
+
+    cursor.execute("""
+        UPDATE users
+        SET status = ?, verification_status = ?,
+            verified_at = CASE WHEN ? = 'ACTIVE' THEN COALESCE(verified_at, ?) ELSE verified_at END,
+            updated_at = ?
+        WHERE id = ?
+    """, (new_status, ver_status, new_status, now, now, officer_id))
+
+    # Audit log
+    audit_id = f"aud-{uuid.uuid4().hex[:12]}"
+    cursor.execute("""
+        INSERT INTO system_audit_logs (
+            id, timestamp, user_id, user_email, role, action,
+            resource_type, resource_id, details, ip_address, status
+        ) VALUES (?, ?, ?, ?, ?, 'OFFICER_STATUS_UPDATE', 'USER', ?, ?, 'System CAD', 'SUCCESS')
+    """, (
+        audit_id, now, admin_user.get('id'), admin_user.get('email'), admin_user.get('role'),
+        officer_id, f"Officer {officer.get('name')} ({officer.get('badge_number')}) status changed: {old_status} -> {new_status}. Remarks: {remarks or 'None'}"
+    ))
+
+    conn.commit()
+    conn.close()
+
+    # Notify officer
+    from backend.services.notification_service import create_notification
+    create_notification(
+        user_id=officer_id,
+        title=f"Officer Account Status: {new_status}",
+        message=f"Your police officer account status was updated to {new_status} by Authorized Officer {admin_user.get('name')}." + (f" Remarks: {remarks}" if remarks else ""),
+        notification_type="OFFICER_STATUS_UPDATE",
+        severity="SUCCESS" if new_status == "ACTIVE" else "ALERT",
+        event_id=f"officer-status-{officer_id}-{now}",
+    )
+
+    try:
+        from backend.services.realtime_events import publish
+        publish({
+            'type': 'OFFICER_STATUS_UPDATED',
+            'officer_id': officer_id,
+            'old_status': old_status,
+            'new_status': new_status,
+            'actor_id': admin_user.get('id'),
+            'timestamp': now
+        })
+    except Exception:
+        pass
+
+    officer['status'] = new_status
+    officer['verification_status'] = ver_status
+    officer.pop("password_hash", None)
+    officer.pop("salt", None)
+    return officer
 
 
 def update_staff_profile(user_id: str, **fields: Any) -> Dict[str, Any]:
@@ -395,47 +518,43 @@ def can_user_access_fir(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
     if role in ("ADMIN", "VERIFICATION_OFFICER"):
         return True
     elif role == "OFFICER":
-        return can_user_access_fir_audit(user, fir)
+        return is_assigned_case_handler(user, fir)
     elif role == "CITIZEN":
         return (fir.get("citizen_id") == user_id) or (fir.get("citizenId") == user_id)
     
     return False
 
 
-def can_user_access_fir_audit(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
+def is_assigned_case_handler(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
     """
-    Strict Authorization Rule for Detailed FIR Change Audit Trail:
-    - CITIZEN: CANNOT access detailed audit (Notification Only). Returns False.
-    - UNAUTHORIZED OFFICER: If not assigned to this FIR and not supervisor, Returns False.
-    - AUTHORIZED OFFICER: Assigned officer (assigned_officer_id == user.id) or station lead, Returns True.
-    - VERIFICATION OFFICER / ADMIN: Authorized supervisor or verification officer, Returns True.
+    True for the officer assigned to the FIR or a supervisor of the same station.
+    Grants case-handling access; it deliberately does NOT grant forensic audit access.
     """
     if not user or not fir:
         return False
-
-    role = user.get("role")
-    user_id = user.get("id")
-
-    if role == "CITIZEN":
-        # Citizens MUST NOT see detailed audit, old vs new, or officer diffs
+    if user.get("role") != "OFFICER":
         return False
 
-    if role in ("ADMIN", "VERIFICATION_OFFICER"):
+    user_id = user.get("id")
+    assigned_id = fir.get("assigned_officer_id") or fir.get("assignedOfficerId")
+    if assigned_id and assigned_id == user_id:
         return True
 
-    if role == "OFFICER":
-        # Check if officer is explicitly assigned to this FIR
-        assigned_id = fir.get("assigned_officer_id") or fir.get("assignedOfficerId")
-        if assigned_id and assigned_id == user_id:
-            return True
-        
-        # Or if officer is station in-charge of that police station
-        if fir.get("police_station") == user.get("station") and user.get("rank") in ("Police Inspector", "Circle Inspector", "Station House Officer (SHO)"):
-            return True
+    return fir.get("police_station") == user.get("station") and user.get("rank") in (
+        "Police Inspector", "Circle Inspector", "Station House Officer (SHO)"
+    )
 
-        return False
 
-    return False
+def can_user_access_fir_audit(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
+    """
+    Strict Authorization Rule for the forensic audit trail, FIR version hashes and
+    blockchain metadata.
+
+    - AUTHORIZED OFFICER (ADMIN): the only role with access.
+    - CITIZEN, VERIFICATION OFFICER, POLICE OFFICER: always denied. Hash values,
+      blockchain metadata and old-vs-new officer diffs must stay hidden from them.
+    """
+    return bool(user and fir and user.get("role") == "ADMIN")
 
 
 def can_user_modify_fir(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
@@ -453,6 +572,6 @@ def can_user_modify_fir(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
     if role in ("ADMIN", "VERIFICATION_OFFICER"):
         return True
     if role == "OFFICER":
-        return can_user_access_fir_audit(user, fir)
+        return is_assigned_case_handler(user, fir)
     
     return False

@@ -4,7 +4,7 @@ Handles:
 1. Citizen online FIR submission
 2. Immutable Version Control
 3. Cryptographic SHA-256 hashing & Blockchain Audit Event recording
-4. Officer-controlled modifications with mandatory reasons and Old vs New diffs
+4. Officer-controlled modifications with an optional reason and Old vs New diffs
 5. Role-based notification output separation:
    - Citizen: Simple notification only ("Your FIR has been updated by an authorized police officer.")
    - Authorized Officer: Forensic audit trail with Old vs New diffs and blockchain proofs
@@ -27,7 +27,7 @@ from backend.services.auth_service import (
 from backend.services.blockchain_service import record_fir_change, record_fir_created, verify_fir_integrity
 from backend.services.crypto_service import calculate_sha256, canonical_json, extract_canonical_fir_data
 from backend.services.db import get_db_connection
-from backend.services.notification_service import create_notification
+from backend.services.notification_service import create_notification, notify_role
 
 
 def format_ist_timestamp(dt: Optional[datetime] = None) -> Tuple[str, str, str]:
@@ -387,7 +387,7 @@ def update_fir(
     """
     Authorized Police Officer modifies an existing FIR.
     1. Validates officer authorization (must be assigned officer, station lead, or admin).
-    2. Validates mandatory change reason.
+    2. Validates the actor's edit permission; the change reason is optional.
     3. Loads current FIR and previous version hash (H_old).
     4. Computes changed fields diff (OLD vs NEW).
     5. Computes new canonical state and new SHA-256 hash (H_new).
@@ -402,8 +402,8 @@ def update_fir(
     10. Creates Output B (Authorized Officer Alert):
        - Officer alert with badge, version transition, fields count, and audit link.
     """
-    if not change_reason or not change_reason.strip():
-        raise ValueError("A mandatory reason for modification must be provided by the officer.")
+    # A reason is optional; when one is supplied it is recorded in the audit trail.
+    change_reason = (change_reason or "").strip()
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -575,24 +575,53 @@ def update_fir(
         severity="INFO"
     )
 
-    # 6. OUTPUT B — AUTHORIZED POLICE / SUPERVISOR NOTIFICATION
-    officer_msg = (
-        f"FIR: {current_fir.get('fir_number')}\n"
-        f"Modified by: {actor_user.get('badge_number') or 'N/A'}\n"
-        f"Date: {date_str}\n"
-        f"Time: {time_str}\n"
-        f"Version: {old_version} → {new_version}\n"
-        f"Fields changed: {len(changed_fields_list)}"
+    # 6. OUTPUT B — role-based delivery of the amendment (§5 delivery matrix)
+    case_reference = current_fir.get("fir_number")
+    actor_label = f"{actor_user.get('role', 'OFFICER').replace('_', ' ').title()} {actor_user.get('name', 'Officer')}"
+    assigned_officer_id = current_fir.get("assigned_officer_id")
+
+    if assigned_officer_id and assigned_officer_id != actor_user.get("id"):
+        create_notification(
+            user_id=assigned_officer_id,
+            fir_id=fir_id,
+            title="Case Record Amended",
+            message=(
+                f"FIR {case_reference} was amended by {actor_label}. "
+                f"Version {old_version} → {new_version}, {len(changed_fields_list)} field(s) changed. "
+                f"Reason: {change_reason or 'Not provided'}"
+            ),
+            notification_type="FIR_UPDATE",
+            severity="INFO",
+            event_id=f"fir-assigned-officer-{change_event_id}",
+        )
+
+    notify_role(
+        "VERIFICATION_OFFICER",
+        "FIR Record Updated",
+        (
+            f"FIR {case_reference} was amended by {actor_label} "
+            f"(version {old_version} → {new_version}, {len(changed_fields_list)} field(s) changed)."
+        ),
+        f"fir-update-verification-{change_event_id}",
+        fir_id=fir_id,
+        notification_type="FIR_UPDATE",
+        severity="INFO",
+        exclude_user_id=actor_user.get("id"),
     )
 
-    create_notification(
-        user_id=actor_user.get("id"),
+    notify_role(
+        "ADMIN",
+        "FIR Amendment Audit Record",
+        (
+            f"FIR {case_reference}: {actor_label} changed {', '.join(changed_fields_list)} "
+            f"in version {old_version} → {new_version}. Reason: {change_reason or 'Not provided'}. "
+            f"Audit event {event_number}."
+        ),
+        f"fir-update-audit-{change_event_id}",
         fir_id=fir_id,
-        title="⚠ FIR RECORD MODIFIED",
-        message=officer_msg,
-        notification_type="OFFICER_AUDIT_ALERT",
-        event_id=change_event_id,
-        severity="WARNING"
+        notification_type="AUDIT_ALERT",
+        severity="WARNING",
+        exclude_user_id=actor_user.get("id"),
     )
 
     # Server-side activity log for operational case tracking
@@ -604,7 +633,7 @@ def update_fir(
             fir_number=current_fir.get("fir_number", fir_id),
             status_from=current_fir.get("status"),
             status_to=updated_fir_dict.get("status", current_fir.get("status")),
-            details=f"{actor_user.get('role', 'OFFICER')} {actor_user.get('name', 'Officer')} updated {len(changed_fields_list)} field(s). Reason: {change_reason.strip()}"
+            details=f"{actor_user.get('role', 'OFFICER')} {actor_user.get('name', 'Officer')} updated {len(changed_fields_list)} field(s). Reason: {change_reason or 'Not provided'}"
         )
     except Exception:
         pass
@@ -708,12 +737,13 @@ def get_firs(
     if actor_user and actor_user.get("role") == "OFFICER":
         rows = [row for row in rows if can_user_access_fir(actor_user, row)]
 
-    # Attach live cryptographic integrity badge status
-    for row in rows:
-        integrity = verify_fir_integrity(row["id"])
-        row["integrity_status"] = integrity.get("status")
-        row["integrity_valid"] = integrity.get("is_valid", False)
-        row["blockchain_block"] = integrity.get("blockchain_block")
+    # Attach live cryptographic integrity badge status — Authorized Officers only.
+    if actor_user and actor_user.get("role") == "ADMIN":
+        for row in rows:
+            integrity = verify_fir_integrity(row["id"])
+            row["integrity_status"] = integrity.get("status")
+            row["integrity_valid"] = integrity.get("is_valid", False)
+            row["blockchain_block"] = integrity.get("blockchain_block")
 
     return rows
 
@@ -726,8 +756,12 @@ def get_fir_by_id(fir_id: str, actor_user: Optional[Dict[str, Any]] = None) -> O
 
     cursor.execute("""
         SELECT f.*, u.name AS citizen_name, u.phone AS citizen_phone, u.email AS citizen_email,
+               u.username AS citizen_username,
                u.gov_id_masked, u.address AS citizen_address,
-               o.name AS officer_name, o.badge_number AS officer_badge, o.rank AS officer_rank, o.station AS officer_station
+               o.name AS officer_name, o.badge_number AS officer_badge, o.rank AS officer_rank, o.station AS officer_station,
+               (SELECT a.assigned_at FROM officer_assignments a
+                WHERE a.fir_id = f.id AND a.officer_id = f.assigned_officer_id
+                ORDER BY a.assigned_at DESC LIMIT 1) AS assigned_at
         FROM firs f
         LEFT JOIN users u ON f.citizen_id = u.id
         LEFT JOIN users o ON f.assigned_officer_id = o.id
@@ -744,22 +778,22 @@ def get_fir_by_id(fir_id: str, actor_user: Optional[Dict[str, Any]] = None) -> O
     if actor_user and not can_user_access_fir(actor_user, fir_dict):
         raise PermissionError("Forbidden: You are not authorized to view this FIR.")
 
-    integrity = verify_fir_integrity(fir_id)
-    fir_dict["integrity"] = integrity
+    if actor_user and actor_user.get("role") == "ADMIN":
+        fir_dict["integrity"] = verify_fir_integrity(fir_id)
     return fir_dict
 
 
 def get_fir_versions(fir_id: str, actor_user: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Retrieve full version history for an FIR.
-    Strictly restricted to Authorized Officers and Supervisors.
+    Restricted to Authorized Officers; version hashes stay hidden from every other role.
     """
     fir = get_fir_by_id(fir_id, actor_user)
     if not fir:
         return []
 
     if actor_user and not can_user_access_fir_audit(actor_user, fir):
-        raise PermissionError("Forbidden: Detailed FIR version history is restricted to authorized investigating officers and supervisors.")
+        raise PermissionError("Forbidden: FIR version history and hashes are restricted to Authorized Officers.")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -778,14 +812,14 @@ def get_fir_versions(fir_id: str, actor_user: Optional[Dict[str, Any]] = None) -
 def get_fir_changes(fir_id: str, actor_user: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Retrieve all logged change events with forensic diffs for an FIR.
-    Strictly restricted to Authorized Officers and Supervisors.
+    Restricted to Authorized Officers.
     """
     fir = get_fir_by_id(fir_id, actor_user)
     if not fir:
         return []
 
     if actor_user and not can_user_access_fir_audit(actor_user, fir):
-        raise PermissionError("Forbidden: Detailed FIR change audit history is restricted to authorized investigating officers and supervisors.")
+        raise PermissionError("Forbidden: FIR change audit history is restricted to Authorized Officers.")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -894,7 +928,7 @@ def get_fir_timeline(fir_id: str, actor_user: Optional[Dict[str, Any]] = None) -
             timeline.append({
                 "type": "FIR_UPDATED",
                 "title": f"● FIR UPDATED (v{ch.get('previous_version', 1)} → v{ch.get('new_version', 2)})",
-                "description": f"Officer: {ch.get('actor_badge', 'N/A')} · {len(fields)} fields changed\nReason: {ch.get('reason')}",
+                "description": f"Officer: {ch.get('actor_badge', 'N/A')} · {len(fields)} fields changed\nReason: {ch.get('reason') or 'Not provided'}",
                 "timestamp": ch.get("timestamp"),
                 "icon": "update",
                 "color": "indigo",
@@ -983,7 +1017,8 @@ def verify_fir(fir_id: str, verified_by_user: Dict[str, Any]) -> Dict[str, Any]:
         title="✓ Your FIR Has Been Verified",
         message=f"Your FIR {fir['fir_number']} has been verified and accepted by the police department. The case will be assigned to an investigating officer shortly.",
         notification_type="FIR_VERIFIED",
-        severity="SUCCESS"
+        severity="SUCCESS",
+        event_id=f"fir-verified-citizen-{fir_id}-{fir['status']}",
     )
 
     # Notify verifying officer
@@ -993,7 +1028,8 @@ def verify_fir(fir_id: str, verified_by_user: Dict[str, Any]) -> Dict[str, Any]:
         title="FIR Verification Complete",
         message=f"FIR {fir['fir_number']} has been verified and marked as VERIFIED.",
         notification_type="FIR_VERIFIED",
-        severity="SUCCESS"
+        severity="SUCCESS",
+        event_id=f"fir-verified-actor-{fir_id}-{fir['status']}",
     )
 
     try:
@@ -1208,6 +1244,38 @@ def assign_officer_to_fir(fir_id: str, officer_id: str, assigned_by_user: Dict[s
             event_id=f"officer-reassigned-{fir_id}-{previous_officer_id}-{iso_now}",
         )
 
+    # §5 delivery matrix for a police assignment: the verification desk that queued
+    # the case and the audit desk both track the assignment outcome.
+    assigning_role = assigned_by_user.get("role", "OFFICER").replace("_", " ").title()
+    assigner_label = f"{assigning_role} {assigned_by_user.get('name', 'Officer')}"
+
+    notify_role(
+        "VERIFICATION_OFFICER",
+        "Investigating Officer Assigned",
+        (f"FIR {fir['fir_number']} was assigned to {rank} {officer['name']} ({station}) "
+         f"by {assigner_label}."),
+        f"assignment-verification-{fir_id}-{officer_id}-{iso_now}",
+        fir_id=fir_id,
+        complaint_id=fir.get("complaint_id"),
+        notification_type="OFFICER_ASSIGNMENT",
+        severity="INFO",
+        exclude_user_id=assigned_by_user.get("id"),
+    )
+
+    notify_role(
+        "ADMIN",
+        "Officer Assignment Audit Record",
+        (f"FIR {fir['fir_number']}: {assigner_label} assigned {rank} {officer['name']} "
+         f"({station}, Badge {officer.get('badge_number') or 'N/A'}) as investigating officer."
+         + (" The previous assignment record was superseded." if previous_officer_id else "")),
+        f"assignment-audit-{fir_id}-{officer_id}-{iso_now}",
+        fir_id=fir_id,
+        complaint_id=fir.get("complaint_id"),
+        notification_type="AUDIT_ALERT",
+        severity="INFO",
+        exclude_user_id=assigned_by_user.get("id"),
+    )
+
     try:
         log_officer_activity(
             user=assigned_by_user,
@@ -1318,8 +1386,8 @@ def create_fir_from_complaint(complaint_id: str, officer_user: Dict[str, Any]) -
         "incident_time": complaint.get("incident_time") or str(complaint["submitted_at"])[11:16] or datetime.now().strftime("%H:%M"),
         "incident_location": complaint["location"],
         "description": complaint["description"],
-        "accused_details": "Under Investigation",
-        "witness_details": "None provided",
+        "accused_details": complaint.get("accused_details") or "Under Investigation",
+        "witness_details": complaint.get("witness_details") or "None provided",
         "evidence_files": complaint.get("evidence_files") or "[]",
         "assigned_officer_id": investigating_officer_id,
     }
@@ -1422,6 +1490,15 @@ def create_fir_from_complaint(complaint_id: str, officer_user: Dict[str, Any]) -
     except Exception as exc:
         print(f"Blockchain record error for {fir_number}: {exc}")
 
+    # Auto-generate the official FIR PDF immediately so the Police Officer
+    # portal and citizen always have a document to download without an extra
+    # manual step by the Verification Officer.
+    try:
+        from backend.services.fir_document_service import generate_fir_pdf as _gen_pdf
+        _gen_pdf(fir_id, officer_user)
+    except Exception as exc:
+        print(f"FIR PDF auto-generation error for {fir_number}: {exc}")
+
     # Notify citizen
     create_notification(
         user_id=complaint["citizen_id"],
@@ -1474,6 +1551,40 @@ def create_fir_from_complaint(complaint_id: str, officer_user: Dict[str, Any]) -
             severity="SUCCESS",
             event_id=f"fir-registered-actor-{fir_id}",
         )
+
+    # The verification desk that raised the record and the audit desk both need the
+    # registration event; the actor is excluded as they already have the confirmation.
+    registering_role = officer_user.get("role", "OFFICER").replace("_", " ").title()
+    actor_label = f"{registering_role} {officer_user.get('name', 'Officer')}"
+    complaint_ref = complaint.get("reference", complaint_id)
+
+    notify_role(
+        "VERIFICATION_OFFICER",
+        "FIR Registered",
+        (f"FIR {fir_number} has been registered from complaint {complaint_ref} "
+         f"by {actor_label}."),
+        f"fir-register-verification-{fir_id}",
+        fir_id=fir_id,
+        complaint_id=complaint_id,
+        notification_type="FIR_REGISTERED",
+        severity="INFO",
+        exclude_user_id=officer_user.get("id"),
+    )
+
+    notify_role(
+        "ADMIN",
+        "FIR Registration Audit Record",
+        (f"FIR {fir_number} registered from complaint {complaint_ref} by {actor_label}. "
+         + (f"Investigating officer: {investigating_officer_name}. "
+            if investigating_officer_id else "No investigating officer assigned yet. ")
+         + f"Version 1 recorded at {iso_now}."),
+        f"fir-register-audit-{fir_id}",
+        fir_id=fir_id,
+        complaint_id=complaint_id,
+        notification_type="AUDIT_ALERT",
+        severity="INFO",
+        exclude_user_id=officer_user.get("id"),
+    )
 
     try:
         from backend.services.case_tracking_service import (

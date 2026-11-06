@@ -21,6 +21,7 @@ from backend.services.auth_service import (
     citizen_login_denial_reason,
     get_citizen_access_issue,
     get_session_user_strict,
+    get_staff_access_issue,
     get_user_by_id,
     set_current_user
 )
@@ -79,7 +80,7 @@ def get_auth_user_from_request(x_user_id: Optional[str] = Header(None)) -> Dict[
             detail='Authentication required. Sign in to the portal, or send X-User-Id under TEST_MODE=1.',
         )
 
-    access_issue = get_citizen_access_issue(user)
+    access_issue = get_citizen_access_issue(user) or get_staff_access_issue(user)
     if access_issue:
         raise HTTPException(status_code=403, detail=access_issue)
     return user
@@ -178,7 +179,7 @@ class CreateFIRPayload(BaseModel):
 
 class UpdateFIRPayload(BaseModel):
     updated_fields: Dict[str, Any]
-    change_reason: str
+    change_reason: Optional[str] = ""
 
 
 @api_router.get("/firs")
@@ -218,15 +219,19 @@ def api_get_fir_details(fir_id: str, x_user_id: Optional[str] = Header(None)):
 
 @api_router.patch("/firs/{fir_id}")
 def api_update_fir(fir_id: str, payload: UpdateFIRPayload, x_user_id: Optional[str] = Header(None)):
-    """Modify permitted FIR fields with mandatory change reason and blockchain anchoring."""
+    """Modify permitted FIR fields; the change reason is optional and recorded when given."""
     user = get_auth_user_from_request(x_user_id)
     try:
         res = update_fir(
             fir_id=fir_id,
             actor_user=user,
             updated_fields=payload.updated_fields,
-            change_reason=payload.change_reason
+            change_reason=payload.change_reason or ""
         )
+        if user.get("role") != "ADMIN":
+            # Version hashes stay inside the Authorized Officer audit view.
+            for key in ("previous_hash", "new_hash"):
+                res.pop(key, None)
         return res
     except PermissionError as pe:
         raise HTTPException(status_code=403, detail=str(pe))
@@ -280,9 +285,20 @@ def api_get_fir_timeline(fir_id: str, x_user_id: Optional[str] = Header(None)):
 # ==========================================
 # 4. BLOCKCHAIN VERIFICATION & INTEGRITY
 # ==========================================
+def require_authorized_officer(user: Dict[str, Any]) -> Dict[str, Any]:
+    """Hashes, ledger contents and tamper simulations are Authorized-Officer-only."""
+    if user.get("role") != "ADMIN":
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: cryptographic integrity and blockchain data are restricted to Authorized Officers.",
+        )
+    return user
+
+
 @api_router.post("/firs/{fir_id}/verify-integrity")
-def api_verify_integrity(fir_id: str):
+def api_verify_integrity(fir_id: str, x_user_id: Optional[str] = Header(None)):
     """Verify whether current database record matches blockchain proof."""
+    require_authorized_officer(get_auth_user_from_request(x_user_id))
     return verify_fir_integrity(fir_id)
 
 
@@ -467,12 +483,38 @@ def api_secure_fir_document(fir_id: str):
     )
 
 
+@api_router.get("/secure/fir-documents/{fir_id}/version/{version}")
+def api_secure_fir_document_version(fir_id: str, version: int):
+    """Serve a specific version of the official FIR PDF to authorized users only."""
+    from backend.services.fir_document_service import document_path_for_version
+
+    user = get_session_user_strict()
+    if not user:
+        raise HTTPException(status_code=403, detail="Authentication required.")
+
+    resolved = document_path_for_version(fir_id, version, user)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="FIR document version not available.")
+
+    absolute_path, download_name = resolved
+    return FileResponse(
+        absolute_path,
+        media_type="application/pdf",
+        filename=download_name,
+        headers={
+            "Cache-Control": "no-store, private",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 # ==========================================
 # 6. BLOCKCHAIN LEDGER & TAMPER DEMO
 # ==========================================
 @api_router.get("/blockchain/ledger")
-def api_get_ledger(limit: int = 50):
+def api_get_ledger(limit: int = 50, x_user_id: Optional[str] = Header(None)):
     """Inspect mined blocks and transaction proofs on the blockchain."""
+    require_authorized_officer(get_auth_user_from_request(x_user_id))
     return get_blockchain_ledger(limit=limit)
 
 
@@ -483,14 +525,16 @@ class SimulateTamperPayload(BaseModel):
 
 
 @api_router.post("/blockchain/simulate-tamper")
-def api_simulate_tamper(payload: SimulateTamperPayload):
+def api_simulate_tamper(payload: SimulateTamperPayload, x_user_id: Optional[str] = Header(None)):
     """Simulate unauthorized database modification to test tamper detection."""
+    require_authorized_officer(get_auth_user_from_request(x_user_id))
     return simulate_db_tamper(payload.fir_id, payload.field_name, payload.malicious_value)
 
 
 @api_router.post("/blockchain/restore-fir/{fir_id}")
-def api_restore_fir(fir_id: str):
+def api_restore_fir(fir_id: str, x_user_id: Optional[str] = Header(None)):
     """Restore database record to confirmed blockchain snapshot."""
+    require_authorized_officer(get_auth_user_from_request(x_user_id))
     return restore_tampered_fir(fir_id)
 
 
