@@ -18,7 +18,7 @@ from frontend.i18n import set_language  # ensure i18n is loaded
 
 from backend.api import api_router
 from frontend.pages.home import create_home_page
-from frontend.pages import admin, citizen, chat, login, police, register, staff_login, verification, citizen_verification, citizen_application_status, authorized_officer_ng, officer_audit
+from frontend.pages import admin, citizen, chat, login, police, register, staff_login, verification, citizen_verification, citizen_application_status, citizen_activation, authorized_officer_ng, officer_audit
 from backend.services.db import init_database
 from backend.services.seed_data import seed_database
 from backend.services.staff_accounts import ensure_seed_staff_accounts

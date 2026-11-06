@@ -80,6 +80,36 @@ def register_user(
     return user
 
 
+def set_password(user_id: str, password: str) -> Dict[str, Any]:
+    """Replace an existing account's password with a fresh PBKDF2 hash and salt.
+
+    Used by the citizen activation and password-reset flows, which are the only
+    times a permanent password is chosen after registration. The plaintext
+    password is never stored, returned or logged.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, role FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise ValueError("No account matches that activation link.")
+
+    password_hash, salt = hash_password(password)
+    now = datetime.now(timezone.utc).isoformat()
+    cursor.execute(
+        """
+        UPDATE users
+        SET password_hash = ?, salt = ?, password_changed_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (password_hash, salt, now, now, user_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"id": user_id, "password_changed_at": now}
+
+
 def get_citizen_access_issue(user: Optional[Dict[str, Any]]) -> Optional[str]:
     """Return the reason a citizen must not enter the protected portal, if any.
 
@@ -157,21 +187,21 @@ def _credentials_match(
 ) -> Optional[Dict[str, Any]]:
     """Load a user and verify their password, without mutating session state.
 
-    Identifiers are case-insensitive and may be the account username (display
-    name), email address, phone number, or staff badge number. An optional role
-    narrows the lookup so the same username can serve several portals; without a
-    role, an identifier that matches more than one account is refused rather than
-    resolved by guesswork.
+    Identifiers are case-insensitive and may be the issued login username, the
+    account display name, email address, phone number, or staff badge number. An
+    optional role narrows the lookup so the same username can serve several
+    portals; without a role, an identifier that matches more than one account is
+    refused rather than resolved by guesswork.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
     clean = (identifier or "").strip().lower()
     query = """
         SELECT * FROM users
-        WHERE (LOWER(email) = ? OR LOWER(phone) = ? OR LOWER(name) = ?
-               OR LOWER(COALESCE(badge_number, '')) = ?)
+        WHERE (LOWER(username) = ? OR LOWER(email) = ? OR LOWER(phone) = ?
+               OR LOWER(name) = ? OR LOWER(COALESCE(badge_number, '')) = ?)
     """
-    params: List[Any] = [clean, clean, clean, clean]
+    params: List[Any] = [clean, clean, clean, clean, clean]
     if required_role:
         query += " AND role = ?"
         params.append(required_role.upper())

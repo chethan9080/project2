@@ -22,10 +22,16 @@ from backend.services.citizen_registration_service import (
     resubmit_additional_information,
     status_label,
 )
+from backend.services.citizen_credentials_service import (
+    SENT as DELIVERY_SENT,
+    NOT_CONFIGURED as DELIVERY_NOT_CONFIGURED,
+    activation_summary,
+    issue_self_service_link,
+)
 from backend.services.realtime_events import subscribe, unsubscribe
 
 STATUS_STYLES = {
-    'PENDING': ('Pending Review', 'bg-amber-50 border-amber-200', 'hourglass_top', 'text-amber-600'),
+    'PENDING': ('Awaiting Verification', 'bg-amber-50 border-amber-200', 'hourglass_top', 'text-amber-600'),
     'UNDER_REVIEW': ('Under Review', 'bg-blue-50 border-blue-200', 'manage_search', 'text-blue-600'),
     'ADDITIONAL_INFO_REQUIRED': (
         'Additional Information Required', 'bg-orange-50 border-orange-300', 'contact_support', 'text-orange-600'
@@ -125,7 +131,7 @@ def citizen_application_status_page() -> None:
             application_status = (application.get('status') or 'PENDING').upper()
             label, card_style, icon_name, icon_color = STATUS_STYLES.get(
                 application_status,
-                ('Pending Review', 'bg-slate-50 border-slate-200', 'hourglass_top', 'text-slate-600'),
+                ('Awaiting Verification', 'bg-slate-50 border-slate-200', 'hourglass_top', 'text-slate-600'),
             )
             latest = _latest_event(application['id'])
             with result_container:
@@ -165,16 +171,7 @@ def citizen_application_status_page() -> None:
                             ).classes('font-mono text-slate-800')
 
                     if application_status == 'APPROVED':
-                        ui.label(
-                            'Your citizen account has been approved. You can now sign in and use the Citizen Portal.'
-                        ).classes('text-xs font-semibold text-emerald-800 mt-4')
-                        ui.button(
-                            'Sign In to Citizen Portal',
-                            icon='login',
-                            on_click=lambda: ui.navigate.to('/login'),
-                        ).props('unelevated').classes(
-                            'mt-3 bg-emerald-700 text-white font-bold rounded-xl px-5 py-2.5 text-xs'
-                        )
+                        _render_approved_block(application)
                     elif application_status == 'REJECTED':
                         ui.label(
                             f"Reason: {(latest or {}).get('remarks') or 'Not provided'}"
@@ -193,7 +190,7 @@ def citizen_application_status_page() -> None:
                         ).classes('text-xs font-semibold text-blue-800 mt-4')
                     else:
                         ui.label(
-                            'Your application is queued for review by a Verification Officer.'
+                            'Your registration is awaiting verification by the Verification Officer.'
                         ).classes('text-xs font-semibold text-amber-800 mt-4')
 
         render_result()
@@ -331,3 +328,122 @@ def _render_resubmission_form(application, state, refresh) -> None:
     with ui.row().classes('w-full justify-center text-xs text-slate-600 mt-2 gap-1.5'):
         ui.label('Need help?')
         ui.link('Return to Citizen Login', '/login').classes('font-bold text-blue-700 hover:underline')
+
+
+def _render_approved_block(application) -> None:
+    """Verified outcome, issued username, activation status and the secure
+    activation option. Nothing secret is shown: the activation link is minted on
+    demand and is single-use, and no password is ever displayed."""
+    summary = activation_summary(application.get('citizen_id') or '')
+
+    if not summary:
+        # Approved before credential issuance existed, or a staff-linked record.
+        ui.label(
+            'Your citizen account has been approved. You can now sign in and use the Citizen Portal.'
+        ).classes('text-xs font-semibold text-emerald-800 mt-4')
+    else:
+        with ui.row().classes('w-full gap-6 flex-wrap pt-4'):
+            with ui.column().classes('gap-0.5'):
+                ui.label('Verification Status').classes('text-[10px] uppercase tracking-wide text-slate-500 font-bold')
+                ui.label('Verified').classes('text-xs font-black text-emerald-800')
+            with ui.column().classes('gap-0.5'):
+                ui.label('Verification Date').classes('text-[10px] uppercase tracking-wide text-slate-500 font-bold')
+                ui.label(str(summary.get('verified_at') or application.get('reviewed_at') or '—')[:10]).classes(
+                    'text-xs font-bold text-slate-800 font-mono'
+                )
+            with ui.column().classes('gap-0.5'):
+                ui.label('Your Login Username').classes('text-[10px] uppercase tracking-wide text-slate-500 font-bold')
+                with ui.row().classes('items-center gap-1'):
+                    ui.label(summary['username']).classes('text-xs font-black text-blue-900 font-mono')
+                    ui.button(icon='copy_all', on_click=lambda u=summary['username']: ui.clipboard.write(u)).props(
+                        'flat dense round size=xs'
+                    ).classes('text-slate-500')
+            with ui.column().classes('gap-0.5'):
+                ui.label('Account Activation').classes('text-[10px] uppercase tracking-wide text-slate-500 font-bold')
+                if summary.get('activated_at'):
+                    ui.badge('Activated').classes('bg-emerald-100 text-emerald-900 font-bold text-[10px]')
+                else:
+                    state = {
+                        'USED': 'Activation link already used',
+                        'EXPIRED': 'Activation link expired',
+                        'AVAILABLE': 'Awaiting activation',
+                    }.get(summary.get('link_status'), 'Awaiting activation')
+                    ui.badge(state).classes('bg-amber-100 text-amber-900 font-bold text-[10px]')
+
+        if summary['delivery_status'] == DELIVERY_SENT:
+            message = (
+                'Your account has been successfully verified. Your username and account activation '
+                'instructions have been sent through your registered notification channel.'
+            )
+            tone = 'text-emerald-800'
+        else:
+            message = (
+                'Your account has been verified, but credential notification delivery failed. '
+                'Please use the secure account activation option or contact support.'
+            )
+            tone = 'text-orange-800'
+        ui.label(message).classes(f'text-xs font-semibold {tone} mt-4')
+
+        if summary['delivery_status'] != DELIVERY_SENT and summary.get('activated_at'):
+            # The activation wording only makes sense before the first sign-in, so an
+            # already-activated citizen is pointed at the equivalent secure option.
+            ui.link(
+                'You have already set a password, so use the secure password reset option instead.',
+                '/citizen/reset-password',
+            ).classes('text-[11px] font-bold text-blue-700 hover:underline mt-1')
+
+        if summary['delivery_status'] == DELIVERY_NOT_CONFIGURED:
+            ui.label(
+                'No email or SMS provider is configured on this server, so nothing could be sent out '
+                'of band. The activation option below is the available channel.'
+            ).classes('text-[11px] text-slate-500 mt-1')
+
+        link_box = ui.column().classes('w-full gap-2 mt-3')
+        link_box.set_visibility(False)
+
+        def reveal_activation_link() -> None:
+            with link_box:
+                link_box.clear()
+                try:
+                    issued = issue_self_service_link(application['citizen_id'])
+                except Exception as error:
+                    ui.label(f'⚠ Could not create an activation link: {error}').classes(
+                        'text-xs font-semibold text-red-600'
+                    )
+                    return
+                ui.label(
+                    f'Secure activation link — works once, expires in {issued["expires_in_hours"]} hours.'
+                ).classes('text-[11px] font-bold text-slate-700')
+                ui.input(
+                    'Activation link',
+                    value=issued['link'],
+                ).classes('w-full').props('readonly outlined').add_slot('append', 'copy_all')
+                ui.button(
+                    'Open Activation Link',
+                    icon='link',
+                    on_click=lambda link=issued['link']: ui.navigate.to(link),
+                ).props('unelevated').classes(
+                    'bg-emerald-700 text-white font-bold rounded-xl px-4 py-2 text-xs self-start'
+                )
+                ui.label(
+                    'Already activated? You can sign in with your username and the password you set '
+                    'at any time.'
+                ).classes('text-[10px] text-slate-500')
+            link_box.set_visibility(True)
+
+        if not summary.get('activated_at'):
+            ui.button(
+                'Get a Secure Activation Link',
+                icon='how_to_reg',
+                on_click=reveal_activation_link,
+            ).props('outline').classes(
+                'mt-3 w-full text-emerald-800 border-emerald-300 font-bold rounded-xl py-2.5 text-xs'
+            )
+
+        ui.button(
+            'Sign In to Citizen Portal',
+            icon='login',
+            on_click=lambda: ui.navigate.to('/login'),
+        ).props('unelevated').classes(
+            'mt-3 bg-emerald-700 text-white font-bold rounded-xl px-5 py-2.5 text-xs'
+        )

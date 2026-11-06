@@ -34,8 +34,17 @@ def create_login_page() -> None:
 
             # Credentials Form
             with ui.column().classes('w-full gap-4'):
-                email_input = ui.input('Username / Email / Phone *', value='', placeholder='Username, email or phone').classes('w-full')
+                email_input = ui.input(
+                    'Username / Email / Phone *',
+                    value='',
+                    placeholder='Your issued username, email or phone',
+                ).classes('w-full')
                 pass_input = ui.input('Password *', value='', password=True, password_toggle_button=True).classes('w-full')
+
+                with ui.row().classes('w-full justify-end'):
+                    ui.link('Forgot password?', '/citizen/reset-password').classes(
+                        'text-[11px] font-bold text-blue-700 hover:underline'
+                    )
 
                 login_message = ui.label('').classes('text-red-600 text-xs font-semibold')
                 status_link = ui.row().classes('w-full items-center gap-1.5 text-xs text-slate-600')

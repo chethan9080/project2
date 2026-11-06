@@ -627,6 +627,24 @@ def record_application_action(
             'reviewer': reviewer_name,
             'timestamp': now,
         })
+
+        if action == 'APPROVE':
+            # Approval provisions the login account. Issuance is idempotent and
+            # delivery reports the provider's own answer, so a second approval of
+            # the same citizen can never mint a second set of credentials.
+            try:
+                from backend.services.citizen_credentials_service import issue_credentials
+                credentials = issue_credentials(updated, actor_user)
+                updated['credentials'] = {
+                    'username': credentials['username'],
+                    'delivery_status': credentials['delivery_status'],
+                    'delivery_channel': credentials.get('delivery_channel'),
+                    'delivery_detail': credentials.get('delivery_detail'),
+                    'created': credentials.get('created', False),
+                }
+            except Exception as exc:
+                updated['credentials_error'] = str(exc)
+                print(f"Citizen credential issuance error: {exc}")
     else:
         publish({
             'type': 'CITIZEN_APPLICATION_REMARKED',

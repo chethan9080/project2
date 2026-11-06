@@ -12,7 +12,7 @@ from nicegui import ui
 
 from frontend.components.navbar import create_topbar
 from frontend.components.sidebar import create_sidebar
-from frontend.components.styles import COLORS, TYPOGRAPHY
+from frontend.components.styles import COLORS, TYPOGRAPHY, SCROLL_SYSTEM_HEAD
 
 # Global Head HTML for PWA & iOS Mobile Optimization
 GLOBAL_IOS_PWA_HEAD = """
@@ -21,7 +21,7 @@ GLOBAL_IOS_PWA_HEAD = """
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="e-FIR Sanctuary">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
@@ -79,7 +79,7 @@ GLOBAL_IOS_PWA_HEAD = """
 """
 
 # Register head metadata
-ui.add_head_html(GLOBAL_IOS_PWA_HEAD, shared=True)
+ui.add_head_html(GLOBAL_IOS_PWA_HEAD + SCROLL_SYSTEM_HEAD, shared=True)
 
 
 @contextmanager

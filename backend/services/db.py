@@ -354,6 +354,59 @@ def init_database() -> None:
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_citizen_alerts_recipient ON citizen_application_alerts(recipient_id, is_read);")
 
+    # 11E. Issued Citizen Login Credentials
+    # One row per approved citizen. The activation token itself is never stored
+    # here (see citizen_activation_tokens), and no plaintext password ever is.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS citizen_credentials (
+        id TEXT PRIMARY KEY,
+        citizen_id TEXT NOT NULL UNIQUE,
+        application_id TEXT,
+        reference TEXT,
+        username TEXT NOT NULL UNIQUE,
+        issued_at TEXT NOT NULL,
+        issued_by TEXT,
+        issued_by_name TEXT,
+        delivery_channel TEXT NOT NULL DEFAULT 'NONE' CHECK(delivery_channel IN ('NONE', 'IN_APP', 'EMAIL', 'SMS')),
+        delivery_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(delivery_status IN ('PENDING', 'SENT', 'FAILED', 'NOT_CONFIGURED')),
+        delivery_detail TEXT,
+        delivery_attempts INTEGER NOT NULL DEFAULT 0,
+        delivered_at TEXT,
+        password_set_at TEXT,
+        activated_at TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (citizen_id) REFERENCES users(id),
+        FOREIGN KEY (application_id) REFERENCES citizen_applications(id)
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_citizen_credentials_delivery ON citizen_credentials(delivery_status, issued_at);")
+
+    # 11F. Single-Use Activation and Password-Reset Tokens
+    # Only a hash of the token is stored, so a database copy cannot mint working
+    # links. Exactly one live token per citizen per purpose.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS citizen_activation_tokens (
+        id TEXT PRIMARY KEY,
+        citizen_id TEXT NOT NULL,
+        purpose TEXT NOT NULL CHECK(purpose IN ('ACCOUNT_ACTIVATION', 'PASSWORD_RESET')),
+        token_hash TEXT NOT NULL UNIQUE,
+        issued_by TEXT,
+        issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 5,
+        used_at TEXT,
+        superseded_at TEXT,
+        FOREIGN KEY (citizen_id) REFERENCES users(id)
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_activation_tokens_lookup ON citizen_activation_tokens(citizen_id, purpose, used_at);")
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_activation_tokens_live
+        ON citizen_activation_tokens(citizen_id, purpose)
+        WHERE used_at IS NULL AND superseded_at IS NULL;
+    """)
+
     # Dynamic migrations for any existing tables
     def add_col_if_missing(table, col_def):
         col_name = col_def.split()[0]
@@ -373,6 +426,22 @@ def init_database() -> None:
     add_col_if_missing("fir_change_events", "new_hash TEXT")
     add_col_if_missing("fir_change_events", "blockchain_block INTEGER")
     add_col_if_missing("notifications", "metadata_json TEXT")
+
+    # Issued login handle + verification outcome for citizens. NULL for staff and
+    # for accounts created before credential issuance existed.
+    add_col_if_missing("users", "username TEXT")
+    add_col_if_missing("users", "verification_status TEXT")
+    add_col_if_missing("users", "verified_at TEXT")
+    add_col_if_missing("users", "password_changed_at TEXT")
+    try:
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE username IS NOT NULL;"
+        )
+    except sqlite3.IntegrityError:
+        # A pre-existing database may already hold duplicate handles. Boot must
+        # still succeed; issuance refuses to add a third and reports the clash.
+        print("[startup] users.username unique index skipped: duplicate handles already present")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_login_lookup ON users(email, phone, name);")
 
     # Create Indexes
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_firs_number ON firs(fir_number);")

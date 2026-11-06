@@ -275,108 +275,122 @@ def citizen_dashboard() -> None:
         def dashboard_content() -> None:
             complaints = get_complaints_for_citizen(user_id)
             firs = get_firs(actor_user={'id': user_id, 'role': 'CITIZEN'})
-            notifications = get_user_notifications(user_id, limit=6)
+            notifications = get_user_notifications(user_id, limit=5)
             unread = get_unread_count(user_id)
+            active_cases = [
+                row for row in _active_case_rows(user_id)
+                if row.get('status') not in ('CLOSED', 'RESOLVED', 'REJECTED')
+            ]
 
-            total_complaints = len(complaints)
-            pending_verification = len([c for c in complaints if c.get('status') == 'SUBMITTED'])
-            registered_firs = len(firs)
-            under_investigation = len([f for f in firs if f.get('status') == 'UNDER_INVESTIGATION'])
-            closed_cases = len([f for f in firs if f.get('status') in ('RESOLVED', 'CLOSED')])
+            with ui.card().classes('w-full p-5 bg-white rounded-2xl border border-slate-200 '
+                                   'border-l-4 border-l-emerald-700 shadow-sm'):
+                with ui.row().classes('w-full items-center gap-4 flex-wrap'):
+                    with ui.element('div').classes(
+                        'w-12 h-12 shrink-0 rounded-full flex items-center justify-center '
+                        'bg-emerald-800 text-white text-lg font-black shadow'
+                    ):
+                        ui.label(str(user.get('name') or 'C')[:1].upper())
+                    with ui.column().classes('gap-1 min-w-0 flex-1'):
+                        with ui.row().classes('items-center gap-2 flex-wrap'):
+                            ui.label(f"{t('Welcome')}, {user.get('name') or t('Citizen')}").classes(
+                                'text-xl font-black text-slate-900 fantasy-title')
+                            render_account_status_badge(user)
+                        ui.label(
+                            f"{len(active_cases)} {t('Active Cases')} · {unread} {t('Unread')}"
+                        ).classes('text-xs font-semibold text-slate-600')
 
-            with ui.card().classes('w-full p-6 bg-white rounded-3xl border-l-4 border-emerald-700 shadow-sm'):
-                with ui.row().classes('w-full items-center justify-between flex-wrap gap-4'):
-                    with ui.row().classes('items-center gap-4'):
-                        with ui.element('div').classes('w-14 h-14 rounded-full flex items-center justify-center bg-emerald-800 text-white font-black text-xl shadow'):
-                            ui.label(str(user.get('name') or 'C')[:1].upper())
-                        with ui.column().classes('gap-1'):
-                            with ui.row().classes('items-center gap-2 flex-wrap'):
-                                ui.label(f"{t('Welcome')}, {user.get('name') or t('Citizen')}").classes('text-2xl md:text-3xl font-black text-slate-900 fantasy-title')
-                                render_account_status_badge(user)
-                            ui.label(f"{t('District')}: {user.get('district') or '—'} · {t('Mobile')}: {user.get('phone') or '—'}").classes('text-xs text-slate-500 font-medium')
-                    with ui.row().classes('gap-2 flex-wrap'):
-                        ui.button('File an FIR', icon='add_circle', on_click=lambda: ui.navigate.to('/citizen/submit')).props('unelevated no-caps').classes('bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded-xl px-5 py-2.5 text-xs')
-                        ui.button(f'Notifications ({unread})', icon='notifications', on_click=lambda: ui.navigate.to('/citizen/notifications')).props('outline no-caps').classes('text-emerald-800 font-bold rounded-xl px-4 py-2.5 text-xs')
-
-            with ui.row().classes('w-full flex-wrap gap-4 mt-2'):
-                stats = [
-                    ('Total Complaints', total_complaints, 'assignment', 'bg-sky-50 border-sky-200', 'text-sky-700'),
-                    ('Pending Verification', pending_verification, 'pending_actions', 'bg-amber-50 border-amber-200', 'text-amber-700'),
-                    ('Registered FIRs', registered_firs, 'description', 'bg-emerald-50 border-emerald-200', 'text-emerald-700'),
-                    ('Under Investigation', under_investigation, 'manage_search', 'bg-violet-50 border-violet-200', 'text-violet-700'),
-                    ('Closed Cases', closed_cases, 'task_alt', 'bg-slate-50 border-slate-200', 'text-slate-700'),
+            with ui.grid().classes('w-full gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-6'):
+                tiles = [
+                    ('File an FIR', 'add_circle', '/citizen/submit', None),
+                    ('My Complaints', 'report_problem', '/citizen/complaints', len(complaints)),
+                    ('FIR Tracking', 'track_changes', '/citizen/tracking', len(firs)),
+                    ('Chat with Officer', 'chat', '/citizen/chat', None),
+                    ('Notifications', 'notifications', '/citizen/notifications', unread),
+                    ('My Profile', 'person', '/citizen/profile', None),
                 ]
-                for label, value, icon_name, bg_cls, text_cls in stats:
-                    with ui.card().classes(f'flex-1 min-w-40 p-5 rounded-2xl border {bg_cls} shadow-xs'):
-                        with ui.row().classes('w-full items-center justify-between'):
-                            ui.icon(icon_name, size='md').classes(text_cls)
-                            ui.label(str(value)).classes('text-3xl font-black text-slate-900')
-                        ui.label(label).classes('text-xs font-bold text-slate-700 mt-2')
+                for label, icon_name, path, count in tiles:
+                    with ui.card().classes(
+                        'w-full cursor-pointer items-center gap-1.5 p-4 text-center rounded-2xl '
+                        'bg-white border border-slate-200 shadow-sm hover:border-emerald-500 transition-colors'
+                    ).on('click', lambda destination=path: ui.navigate.to(destination)):
+                        ui.icon(icon_name, size='md').classes('text-emerald-700')
+                        ui.label(label).classes('text-xs font-bold text-slate-800 leading-tight')
+                        if count:
+                            ui.badge(str(count)).classes(
+                                'bg-emerald-100 text-emerald-900 text-[10px] font-bold px-2 py-0.5 rounded-full')
 
-            with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-3xl shadow-sm mt-2'):
-                with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-100 mb-3'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('history', size='sm').classes('text-emerald-700')
-                        ui.label('Recent Activity').classes('text-lg font-bold text-slate-900 fantasy-title')
-                    ui.button('View Notifications', on_click=lambda: ui.navigate.to('/citizen/notifications')).props('flat dense no-caps size=sm').classes('text-emerald-700 font-bold text-xs')
+            with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-2xl shadow-sm'):
+                with ui.row().classes('w-full items-center gap-2 pb-3 border-b border-slate-100 mb-3'):
+                    ui.icon('folder_shared', size='sm').classes('text-emerald-700')
+                    ui.label('Active Cases').classes('text-base font-bold text-slate-900 fantasy-title')
+
+                if not active_cases:
+                    never_filed = not complaints and not firs
+                    with ui.column().classes('w-full items-center gap-2 py-10 text-center'):
+                        ui.icon('inbox' if never_filed else 'task_alt', size='lg').classes('text-slate-300')
+                        ui.label('No complaints or FIRs yet' if never_filed else 'No active cases').classes(
+                            'text-sm font-bold text-slate-700')
+                        ui.label(
+                            'File an FIR and its verification, assignment and investigation stages will appear here.'
+                            if never_filed else
+                            'Your recent cases are closed. Open My Complaints for the full history.'
+                        ).classes('text-xs text-slate-500 max-w-md leading-relaxed')
+                        if never_filed:
+                            ui.button(
+                                'File an FIR', icon='add_circle',
+                                on_click=lambda: ui.navigate.to('/citizen/submit')
+                            ).props('unelevated no-caps').classes(
+                                'mt-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl px-5 py-2 text-xs font-bold')
+                else:
+                    with ui.column().classes('w-full gap-2'):
+                        for row in active_cases[:5]:
+                            with ui.row().classes(
+                                'w-full items-center justify-between flex-wrap gap-3 p-3 rounded-xl '
+                                'border border-slate-200 bg-slate-50/60'):
+                                with ui.column().classes('gap-0.5 flex-1 min-w-48'):
+                                    with ui.row().classes('items-center gap-2 flex-wrap'):
+                                        ui.label(row['reference']).classes(
+                                            'font-black text-slate-900 font-mono text-sm')
+                                        complaint_badge(row.get('status'))
+                                    ui.label(row.get('title') or '').classes('text-xs font-bold text-slate-700 mt-1')
+                                    ui.label(
+                                        f"{row.get('station') or '—'} · "
+                                        f"{t('Updated')} {fmt_timestamp(row.get('updated_at'), False)}"
+                                    ).classes('text-[10px] text-slate-500')
+                                ui.button(
+                                    'View Details', icon='visibility',
+                                    on_click=lambda url=row['detail_url']: ui.navigate.to(url)
+                                ).props('flat dense no-caps size=sm').classes('text-emerald-700 font-bold text-xs')
+
+            with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-2xl shadow-sm'):
+                with ui.row().classes('w-full items-center gap-2 pb-3 border-b border-slate-100 mb-3'):
+                    ui.icon('history', size='sm').classes('text-emerald-700')
+                    ui.label('Recent Activity').classes('text-base font-bold text-slate-900 fantasy-title')
 
                 if not notifications:
-                    with ui.column().classes('w-full items-center py-8 gap-1 text-center'):
+                    with ui.column().classes('w-full items-center gap-2 py-10 text-center'):
                         ui.icon('history_toggle_off', size='lg').classes('text-slate-300')
-                        ui.label('No activity yet.').classes('text-sm font-bold text-slate-600')
-                        ui.label('Updates about your complaints and FIRs will appear here.').classes('text-xs text-slate-400')
+                        ui.label('No activity yet.').classes('text-sm font-bold text-slate-700')
+                        ui.label(
+                            'Updates about your complaints and FIRs will appear here.'
+                        ).classes('text-xs text-slate-500 max-w-md leading-relaxed')
                 else:
                     with ui.column().classes('w-full gap-2'):
                         for notif in notifications:
                             is_read = notif.get('is_read', 0) == 1
-                            with ui.row().classes(f'w-full p-3 rounded-xl border items-center gap-3 {"bg-slate-50 border-slate-200" if is_read else "bg-amber-50/70 border-amber-200"}'):
-                                ui.icon(_notification_icon(notif.get('severity'), notif.get('type')), size='xs').classes('text-emerald-700')
+                            with ui.row().classes(
+                                f'w-full items-center gap-3 p-3 rounded-xl border '
+                                f'{"bg-slate-50 border-slate-200" if is_read else "bg-amber-50/70 border-amber-200"}'):
+                                ui.icon(
+                                    _notification_icon(notif.get('severity'), notif.get('type')), size='xs'
+                                ).classes('text-emerald-700 shrink-0')
                                 with ui.column().classes('gap-0 flex-1 min-w-0'):
-                                    ui.label(notif.get('title') or 'Notification').classes('text-xs font-bold text-slate-900 truncate')
-                                    ui.label(str(notif.get('message') or '')).classes('text-[11px] text-slate-600 line-clamp-1')
-                                ui.label(fmt_timestamp(notif.get('created_at'))[5:16]).classes('text-[10px] text-slate-400 font-mono shrink-0')
-
-            cases = [row for row in _active_case_rows(user_id) if row.get('status') not in ('CLOSED', 'RESOLVED', 'REJECTED')][:6]
-            with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-3xl shadow-sm'):
-                with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-100 mb-3'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('folder_shared', size='sm').classes('text-emerald-700')
-                        ui.label('Active Cases').classes('text-lg font-bold text-slate-900 fantasy-title')
-                    ui.button('My Complaints', on_click=lambda: ui.navigate.to('/citizen/complaints')).props('flat dense no-caps size=sm').classes('text-emerald-700 font-bold text-xs')
-
-                if not cases:
-                    with ui.column().classes('w-full items-center py-8 gap-1 text-center'):
-                        ui.icon('inbox', size='lg').classes('text-slate-300')
-                        ui.label('No active cases.').classes('text-sm font-bold text-slate-600')
-                        ui.label('File an FIR to get started.').classes('text-xs text-slate-400')
-                        ui.button('File an FIR', icon='add_circle', on_click=lambda: ui.navigate.to('/citizen/submit')).props('unelevated no-caps').classes('mt-2 bg-emerald-700 text-white rounded-xl px-5 py-2 text-xs font-bold')
-                else:
-                    with ui.column().classes('w-full gap-2'):
-                        for row in cases:
-                            with ui.row().classes('w-full items-center justify-between flex-wrap gap-2 p-3 rounded-xl border border-slate-200 bg-slate-50/60'):
-                                with ui.column().classes('gap-0 flex-1 min-w-48'):
-                                    with ui.row().classes('items-center gap-2 flex-wrap'):
-                                        ui.label(row['reference']).classes('font-black text-slate-900 font-mono text-sm')
-                                        complaint_badge(row.get('status'))
-                                    ui.label(row.get('title') or '').classes('text-xs font-bold text-slate-700 mt-1')
-                                    ui.label(f"{'FIR' if row['kind'] == 'fir' else 'Complaint'} · {row.get('station') or '—'} · Updated {fmt_timestamp(row.get('updated_at'), False)}").classes('text-[10px] text-slate-500')
-                                ui.button('View Details', icon='visibility', on_click=lambda url=row['detail_url']: ui.navigate.to(url)).props('flat dense no-caps size=sm').classes('text-emerald-700 font-bold text-xs')
-
-            application = get_application_by_citizen(user_id)
-            with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-3xl shadow-sm'):
-                with ui.row().classes('w-full items-center justify-between flex-wrap gap-3'):
-                    with ui.row().classes('items-center gap-3'):
-                        with ui.element('div').classes('w-10 h-10 rounded-xl flex items-center justify-center bg-emerald-50 border border-emerald-200'):
-                            ui.icon('verified_user', size='sm').classes('text-emerald-700')
-                        with ui.column().classes('gap-0'):
-                            ui.label('Account Verification').classes('text-sm font-bold text-slate-900')
-                            if application:
-                                ui.label(f"Application {application.get('reference') or '—'} · {str(application.get('status') or '').replace('_', ' ').title()}").classes('text-[11px] text-slate-500')
-                            else:
-                                ui.label('Verified citizen account').classes('text-[11px] text-slate-500')
-                    with ui.row().classes('items-center gap-2'):
-                        render_account_status_badge(user)
-                        ui.button('View Profile', on_click=lambda: ui.navigate.to('/citizen/profile')).props('flat dense no-caps size=sm').classes('text-emerald-700 font-bold text-xs')
+                                    ui.label(notif.get('title') or 'Notification').classes(
+                                        'text-xs font-bold text-slate-900 truncate')
+                                    ui.label(str(notif.get('message') or '')).classes(
+                                        'text-[11px] text-slate-600 line-clamp-1')
+                                ui.label(fmt_timestamp(notif.get('created_at'))[5:16]).classes(
+                                    'text-[10px] text-slate-400 font-mono shrink-0')
 
         dashboard_content()
 

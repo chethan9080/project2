@@ -2,10 +2,22 @@
 Sidebar Navigation System for Citizen, Police, and Admin Portals.
 """
 
-from nicegui import ui
+from typing import Any, Optional
+from weakref import WeakValueDictionary
+
+from nicegui import ui, context
 from backend.services.auth_service import get_current_user, set_current_user
 # Ranks that are considered "authorized" for tampering audit access
 from backend.services.audit_service import AUTHORIZED_OFFICER_RANKS
+
+# The citizen drawer hides itself on compact screens, so the topbar menu button
+# needs to find the drawer belonging to the client it is serving.
+_ACTIVE_DRAWERS: WeakValueDictionary = WeakValueDictionary()
+
+
+def get_active_drawer(client_id: str) -> Optional[Any]:
+    """Return the responsive citizen drawer for this client, if one is open."""
+    return _ACTIVE_DRAWERS.get(client_id)
 
 PORTAL_LINKS = {
     'citizen': [
@@ -73,13 +85,18 @@ def create_sidebar(portal: str, active_path: str) -> None:
     user = get_current_user() or {}
     links = list(PORTAL_LINKS.get(portal, PORTAL_LINKS['citizen']))
     portal_color = PORTAL_THEME_COLORS.get(portal, '#1B365D')
+    # Only the citizen portal collapses the drawer on compact screens; the
+    # topbar menu button needs a handle on it to reopen it.
+    responsive = portal == 'citizen'
 
-    with ui.left_drawer(value=True, fixed=False).classes(
+    with ui.left_drawer(value=None if responsive else True, fixed=False).classes(
         'border-r flex flex-col h-screen'
     ).style(
         'background: linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%); '
         'border-color: rgba(203, 213, 225, 0.8);'
-    ):
+    ) as drawer:
+        if responsive:
+            _ACTIVE_DRAWERS[context.client.id] = drawer
         # Header banner
         with ui.element('div').classes('relative px-6 pt-6 pb-4 border-b border-slate-200'):
             ui.element('div').classes('absolute left-0 top-0 bottom-0 w-1.5 rounded-r-full').style(f'background: {portal_color}')
