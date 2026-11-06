@@ -13,12 +13,22 @@ from backend.services.audit_service import get_audit_dashboard_stats, get_all_au
 from backend.services.auth_service import (
     get_all_citizens,
     get_all_officers,
+    get_all_police_officers,
     get_current_user,
     get_user_by_id,
     set_current_user,
+    update_officer_verification_status,
     update_staff_profile,
 )
 from backend.services.complaint_service import get_all_complaints, get_complaints_for_citizen, get_complaint_by_id
+from backend.services.citizen_registration_service import get_application_by_citizen
+from backend.services.complaint_verification_service import action_label as vo_action_label
+from backend.services.fir_document_service import read_document_bytes
+from data.integrity import get_hash_chain_status
+from backend.services.authorized_officer_service import (
+    get_complete_fir_case_history,
+    get_citizen_complete_dossier,
+)
 from backend.services.complaint_evidence_service import evidence_bytes
 from backend.services.blockchain_service import (
     get_blockchain_ledger,
@@ -35,10 +45,16 @@ from backend.services.investigation_service import (
     compute_case_stats,
     get_admin_case_detail,
     get_admin_investigation_overview,
+    get_admin_officer_record,
     get_evidence_file,
     send_officer_instruction,
 )
-from backend.services.notification_service import get_unread_count
+from backend.services.notification_service import (
+    get_unread_count,
+    get_user_notifications,
+    mark_all_read,
+    mark_notification_read,
+)
 from backend.services.realtime_events import subscribe, unsubscribe
 from frontend.components.case_tracking_timeline import render_live_fir_timeline
 
@@ -144,7 +160,7 @@ def admin_dashboard() -> None:
                     ('🔍 FIR Version Comparison & Hash Check', 'compare', '/authorized-officer/comparison'),
                     ('📊 Complete Audit Logs & Activity', 'fact_check', '/admin/audit-logs'),
                     ('🚨 FIR Tampering & Audit Trail', 'policy', '/admin/tampering-audit'),
-                    ('🎖️ Manage Authorized Police Officers', 'badge', '/admin/officers'),
+                    ('🎖️ Police Officer Verification', 'badge', '/admin/officers'),
                 ]:
                     ui.button(label, icon=icon, on_click=lambda dest=path: ui.navigate.to(dest)).props('flat align=left').classes(
                         'w-full justify-start text-slate-800 font-bold py-2.5 hover:bg-slate-100 rounded-xl text-xs my-0.5'
@@ -167,48 +183,312 @@ def admin_dashboard() -> None:
 
 
 # ==========================================
-# 2. AUTHORIZED OFFICERS MANAGEMENT
+# 2. POLICE OFFICER VERIFICATION
 # ==========================================
+
+OFFICER_STATUS_STYLES = {
+    'ACTIVE': ('VERIFIED & ACTIVE', 'bg-emerald-100 text-emerald-900 border-emerald-300'),
+    'PENDING_VERIFICATION': ('PENDING VERIFICATION', 'bg-amber-100 text-amber-900 border-amber-300'),
+    'SUSPENDED': ('SUSPENDED', 'bg-rose-100 text-rose-900 border-rose-300'),
+}
+
+OFFICER_DECISIONS = {
+    'ACTIVE': ('Verify & Activate', 'verified_user', 'bg-emerald-700 hover:bg-emerald-800'),
+    'SUSPENDED': ('Suspend Account', 'block', 'bg-rose-700 hover:bg-rose-800'),
+    'PENDING_VERIFICATION': ('Return to Pending', 'hourglass_top', 'bg-amber-600 hover:bg-amber-700'),
+}
+
+
+def _officer_status_badge(status) -> None:
+    label, classes = OFFICER_STATUS_STYLES.get(
+        str(status or '').upper(), ('NOT REVIEWED', 'bg-slate-100 text-slate-700 border-slate-300'))
+    ui.badge(label).classes(f'border font-bold text-[10px] px-2 py-0.5 rounded-full {classes}')
+
+
+def _officer_decision_dialog(officer: Dict[str, Any], new_status: str, user: Dict[str, Any], on_done) -> None:
+    label, _, _ = OFFICER_DECISIONS[new_status]
+    with ui.dialog() as dlg, ui.card().classes('w-full max-w-lg p-5 bg-white rounded-3xl shadow-2xl'):
+        ui.label(f"{label} — {officer.get('name')}").classes('text-base font-black text-slate-900')
+        ui.label(
+            f"Badge {officer.get('badge_number') or 'not issued'} · current status "
+            f"{officer.get('status') or 'not reviewed'}. The decision is written to the audit trail "
+            'and the officer is notified.'
+        ).classes('text-[11px] text-slate-500 mb-3')
+        remarks = ui.textarea(
+            'Reason / remarks (optional)',
+            placeholder='Recorded against this decision in the officer audit history.',
+        ).props('outlined dense autogrow').classes('w-full text-sm')
+
+        def apply() -> None:
+            try:
+                update_officer_verification_status(officer['id'], new_status, user, remarks.value)
+            except (PermissionError, ValueError) as exc:
+                ui.notify(str(exc), type='negative')
+                return
+            dlg.close()
+            ui.notify(f"{officer.get('name')} is now {new_status.replace('_', ' ')}.", type='positive')
+            on_done()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            ui.button('Cancel', on_click=dlg.close).props('flat no-caps size=sm').classes('text-slate-500 font-bold')
+            ui.button(f'Confirm {label}', icon='gavel', on_click=apply).props(
+                'unelevated no-caps size=sm').classes('bg-indigo-800 text-white font-bold rounded-xl text-xs')
+    dlg.open()
+
+
+def _officer_detail(record: Dict[str, Any], user: Dict[str, Any], on_decide) -> None:
+    officer = record['officer']
+    stats = record['stats']
+    performance = record['performance']
+
+    with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-3xl shadow-sm'):
+        with ui.row().classes('w-full items-center justify-between flex-wrap gap-3 pb-3 border-b border-slate-100'):
+            with ui.column().classes('gap-1'):
+                ui.label(officer.get('name') or 'Unnamed officer').classes('text-xl font-black text-slate-900 fantasy-title')
+                ui.label(
+                    f"{officer.get('rank') or 'Rank not recorded'} · "
+                    f"{officer.get('station') or 'Station not recorded'}"
+                ).classes('text-[11px] text-slate-600')
+            with ui.row().classes('items-center gap-2 flex-wrap'):
+                _officer_status_badge(officer.get('status'))
+                ui.badge(f"{stats['total']} case(s) on file").classes(
+                    'bg-indigo-100 text-indigo-900 font-bold text-[10px] px-2 rounded-full')
+
+        with ui.row().classes('w-full flex-wrap gap-4 mt-4'):
+            _mon_detail('Badge / Officer ID', officer.get('badge_number'), mono=True)
+            _mon_detail('Staff Username', officer.get('username'), mono=True)
+            _mon_detail('Rank', officer.get('rank'))
+            _mon_detail('Police Station', officer.get('station'))
+            _mon_detail('District', officer.get('district'))
+            _mon_detail('Email Address', officer.get('email'), mono=True)
+            _mon_detail('Contact Number', officer.get('phone'), mono=True)
+            _mon_detail('Postal Address', officer.get('address'))
+        with ui.row().classes('w-full flex-wrap gap-4 mt-3 pt-3 border-t border-slate-100'):
+            _mon_detail('Verification Status', officer.get('verification_status'))
+            _mon_detail('Identity Verified On', _mon_fmt(officer.get('verified_at')), mono=True)
+            _mon_detail('Account Provisioned', _mon_fmt(officer.get('created_at')), mono=True)
+            _mon_detail('Last Account Update', _mon_fmt(officer.get('updated_at')), mono=True)
+            _mon_detail('Active Cases', officer.get('active_cases_count'))
+            _mon_detail('Total Assignments', officer.get('total_assignments_count'))
+
+        with ui.row().classes('w-full items-center gap-2 flex-wrap mt-4 pt-3 border-t border-slate-100'):
+            ui.label('Account decision:').classes('text-[11px] font-black text-slate-600 uppercase tracking-wider')
+            current = str(officer.get('status') or '').upper()
+            for status, (label, icon, colour) in OFFICER_DECISIONS.items():
+                if status == current:
+                    continue
+                ui.button(
+                    label, icon=icon,
+                    on_click=lambda oid=officer['id'], st=status: on_decide(oid, st),
+                ).props('unelevated no-caps size=sm').classes(f'{colour} text-white font-bold rounded-xl text-xs')
+            if current in OFFICER_DECISIONS:
+                ui.label(f"Already {OFFICER_STATUS_STYLES[current][0].lower()}.").classes('text-[10px] text-slate-400')
+
+    with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-3xl shadow-sm'):
+        with ui.row().classes('items-center gap-2 pb-3 border-b border-slate-100'):
+            ui.icon('assignment_ind', size='sm').classes('text-indigo-800')
+            ui.label('Assigned FIR Cases').classes('text-sm font-black text-slate-900')
+            ui.badge(
+                f"{stats['total']} assigned · {stats['closed']} closed · {stats['under_investigation']} under investigation"
+            ).classes('bg-slate-100 text-slate-700 font-bold text-[10px] px-2 rounded-full')
+        ui.label(
+            f"Cases completed: {performance['completed_count']} of {performance['assigned_count']} assigned · "
+            f"investigation credits {performance['total_credits']} ({performance['level']})"
+        ).classes('text-[10px] text-slate-500 mt-2')
+
+        if not record['cases']:
+            ui.label('No FIR has been assigned to this officer yet.').classes('text-[11px] text-slate-500 py-4')
+        with ui.column().classes('w-full gap-2 mt-3'):
+            for case in record['cases']:
+                stage_class = ADMIN_STAGE_COLOURS.get(
+                    case.get('current_stage'), 'bg-slate-100 text-slate-600 border-slate-200')
+                with ui.card().classes('w-full p-3 rounded-2xl border border-slate-200 bg-slate-50/60 gap-1'):
+                    with ui.row().classes('w-full items-start justify-between flex-wrap gap-2'):
+                        with ui.column().classes('gap-1 flex-1 min-w-56'):
+                            with ui.row().classes('items-center gap-2 flex-wrap'):
+                                _mon_identity(case.get('fir_number'), case.get('citizen_name'),
+                                              case.get('complaint_reference'))
+                                fir_status_badge(case.get('status'))
+                            ui.badge(case.get('stage_label') or 'Awaiting tracking').classes(
+                                f'border font-bold text-[10px] px-2 py-0.5 rounded-full self-start {stage_class}')
+                            ui.label(
+                                f"{case.get('incident_type') or '—'} · {case.get('police_station') or '—'} · "
+                                f"assigned {_mon_fmt(case.get('assigned_at'))} · last update {_mon_fmt(case.get('last_update_at'))}"
+                            ).classes('text-[10px] text-slate-500')
+                        ui.button(
+                            'Open Case', icon='monitoring',
+                            on_click=lambda fid=case['id']: ui.navigate.to(f'/admin/investigations/{fid}'),
+                        ).props('unelevated no-caps size=sm').classes(
+                            'bg-indigo-800 text-white font-bold rounded-xl text-xs')
+
+        if record['assignments']:
+            ui.label('Assignment trail').classes('text-[11px] font-black text-slate-700 mt-4 mb-1')
+            with ui.column().classes('w-full gap-1'):
+                for entry in record['assignments']:
+                    with ui.row().classes('w-full items-center gap-2 flex-wrap text-[10px]'):
+                        ui.badge(entry.get('status') or 'ACTIVE').classes(
+                            'bg-slate-200 text-slate-700 font-bold px-2 rounded-full')
+                        ui.label(
+                            f"{entry.get('fir_number') or '—'} · Citizen {entry.get('citizen_name') or 'not recorded'} · "
+                            f"assigned by {entry.get('assigned_by_name') or 'not recorded'} on {_mon_fmt(entry.get('assigned_at'))}"
+                        ).classes('text-slate-600')
+
+    with ui.card().classes('w-full p-5 bg-white border border-slate-200 rounded-3xl shadow-sm'):
+        with ui.row().classes('items-center gap-2 pb-3 border-b border-slate-100'):
+            ui.icon('fact_check', size='sm').classes('text-indigo-800')
+            ui.label('Verification & Account Decision History').classes('text-sm font-black text-slate-900')
+        if not record['decisions']:
+            ui.label(
+                'No Authorized Officer decision has been recorded for this account yet.'
+            ).classes('text-[11px] text-slate-500 py-3')
+        with ui.column().classes('w-full gap-2 mt-3'):
+            for decision in record['decisions']:
+                with ui.card().classes('w-full p-3 rounded-2xl border border-slate-200 bg-slate-50/60 gap-1'):
+                    ui.label(
+                        f"{_mon_fmt(decision.get('timestamp'))} · "
+                        f"{decision.get('decided_by_name') or decision.get('user_email') or 'Authorized Officer'}"
+                        f" ({decision.get('role') or 'ADMIN'}"
+                        f"{', badge ' + decision['decided_by_badge'] if decision.get('decided_by_badge') else ''})"
+                    ).classes('text-[11px] font-black text-slate-800')
+                    ui.label(decision.get('details') or '—').classes('text-[10px] text-slate-600')
+
+
 @ui.page('/admin/officers')
 def admin_officers_page() -> None:
-    """Authorized police officers list and credentials."""
-    if not require_admin_user():
+    """Review police officer accounts, decide their status, and open the cases they hold."""
+    user = require_admin_user()
+    if not user:
         return
-    officers = get_all_officers()
 
-    with portal_page('admin', '/admin/officers', 'Authorized Police Officers', 'State police directory of credentialed investigating officers.'):
-        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm'):
-            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-4'):
-                ui.label(f"Credentialed Officers ({len(officers)})").classes('text-xl font-bold text-slate-900 fantasy-title')
+    state = {'query': '', 'status': 'ALL', 'officer_id': None}
 
-            if not officers:
-                with ui.column().classes('w-full items-center py-12 gap-2 text-center'):
-                    ui.icon('badge', size='xl').classes('text-slate-300')
-                    ui.label('No officer accounts provisioned yet.').classes('text-base font-bold text-slate-700')
-                    ui.label('Police officer accounts will appear here once created.').classes('text-xs text-slate-500')
+    def select(officer_id: str) -> None:
+        state['officer_id'] = officer_id
+        directory.refresh()
 
-            with ui.element('div').classes('w-full overflow-x-auto'):
-                with ui.element('table').classes('w-full text-left text-xs border-collapse'):
-                    with ui.element('thead').classes('bg-slate-100 text-slate-700'):
-                        with ui.element('tr'):
-                            for col in ['Badge / ID', 'Officer Name', 'Rank', 'Police Station', 'Email Address', 'Status']:
-                                ui.element('th').classes('p-3 font-bold').text = col
+    def decide(officer_id: str, new_status: str) -> None:
+        officers = {o['id']: o for o in get_all_police_officers()}
+        officer = officers.get(officer_id)
+        if not officer:
+            ui.notify('That officer account no longer exists.', type='negative')
+            directory.refresh()
+            return
+        _officer_decision_dialog(officer, new_status, user, directory.refresh)
 
-                    with ui.element('tbody').classes('divide-y divide-slate-200 bg-white'):
-                        for o in officers:
-                            with ui.element('tr').classes('hover:bg-slate-50'):
-                                with ui.element('td').classes('p-3 font-bold text-blue-900 font-mono'):
-                                    ui.label(o.get('badge_number') or 'N/A')
-                                with ui.element('td').classes('p-3 font-bold text-slate-900'):
-                                    ui.label(o.get('name'))
-                                with ui.element('td').classes('p-3 text-slate-700'):
-                                    ui.label(o.get('rank') or 'Officer')
-                                with ui.element('td').classes('p-3 text-slate-700'):
-                                    ui.label(o.get('station') or 'N/A')
-                                with ui.element('td').classes('p-3 text-slate-600 font-mono'):
-                                    ui.label(o.get('email'))
-                                with ui.element('td').classes('p-3'):
-                                    ui.badge('ACTIVE & VERIFIED').classes('bg-emerald-100 text-emerald-900 font-bold text-[10px]')
+    @ui.refreshable
+    def directory() -> None:
+        everyone = get_all_police_officers()
+        query = state['query'].strip().lower()
+        visible = everyone
+        if query:
+            visible = [
+                o for o in visible
+                if query in ' '.join(str(o.get(k) or '') for k in (
+                    'name', 'badge_number', 'rank', 'station', 'district', 'email', 'username')).lower()
+            ]
+        if state['status'] != 'ALL':
+            visible = [o for o in visible if str(o.get('status') or '').upper() == state['status']]
+
+        def count(status: str) -> int:
+            return sum(1 for o in everyone if str(o.get('status') or '').upper() == status)
+
+        with ui.row().classes('w-full flex-wrap gap-3'):
+            cards_data = [
+                ('Police Officer Accounts', len(everyone), 'badge', '#1E40AF', 'bg-blue-50/80 border-blue-200'),
+                ('Verified & Active', count('ACTIVE'), 'verified_user', '#059669', 'bg-emerald-50/80 border-emerald-200'),
+                ('Pending Verification', count('PENDING_VERIFICATION'), 'hourglass_top', '#D97706', 'bg-amber-50/80 border-amber-200'),
+                ('Suspended', count('SUSPENDED'), 'block', '#DC2626', 'bg-rose-50/80 border-rose-200'),
+                ('Active Cases Held', sum(int(o.get('active_cases_count') or 0) for o in everyone),
+                 'assignment_ind', '#6D28D9', 'bg-purple-50/80 border-purple-200'),
+            ]
+            for label, value, icon_name, colour, background in cards_data:
+                with ui.card().classes(f'min-w-36 flex-1 p-4 rounded-2xl border shadow-xs {background} gap-1'):
+                    with ui.row().classes('w-full items-center justify-between'):
+                        ui.icon(icon_name, size='md').style(f'color: {colour}')
+                        ui.label(str(value)).classes('text-3xl font-black text-slate-900')
+                    ui.label(label).classes('text-[11px] font-bold text-slate-700 leading-tight')
+
+        with ui.row().classes('w-full items-start gap-4 flex-wrap'):
+            with ui.card().classes('w-full md:w-2/5 min-w-72 p-4 bg-white border border-slate-200 rounded-3xl shadow-sm gap-2'):
+                with ui.row().classes('w-full items-center justify-between pb-2 border-b border-slate-100'):
+                    ui.label(f"Officer Directory ({len(visible)})").classes('text-sm font-black text-slate-900')
+                    with ui.row().classes('items-center gap-1'):
+                        ui.icon('bolt', size='xs').classes('text-emerald-600')
+                        ui.label('Live').classes('text-[10px] text-slate-500')
+
+                if not everyone:
+                    with ui.column().classes('w-full items-center py-8 gap-2 text-center'):
+                        ui.icon('badge', size='lg').classes('text-slate-300')
+                        ui.label('No police officer accounts provisioned yet.').classes('text-xs font-bold text-slate-700')
+                        ui.label('Accounts appear here as soon as they are created.').classes('text-[10px] text-slate-500')
+                elif not visible:
+                    ui.label('No officer matches this search or status filter.').classes(
+                        'text-[11px] text-slate-500 py-6 text-center w-full')
+
+                with ui.column().classes('w-full gap-2 mt-2'):
+                    for officer in visible:
+                        selected = officer['id'] == state['officer_id']
+                        with ui.card().classes(
+                            'w-full p-3 rounded-2xl border gap-1 '
+                            + ('border-indigo-400 bg-indigo-50/70' if selected else 'border-slate-200 bg-slate-50/60')
+                        ):
+                            ui.button(
+                                f"{officer.get('name') or 'Unnamed officer'} · {officer.get('badge_number') or 'no badge'}",
+                                on_click=lambda oid=officer['id']: select(oid),
+                            ).props('flat align=left no-caps').classes(
+                                'w-full justify-start text-slate-900 font-black text-xs px-0')
+                            ui.label(
+                                f"{officer.get('rank') or 'Rank not recorded'} · {officer.get('station') or 'Station not recorded'}"
+                            ).classes('text-[10px] text-slate-600')
+                            with ui.row().classes('items-center gap-2 flex-wrap'):
+                                _officer_status_badge(officer.get('status'))
+                                ui.label(
+                                    f"{officer.get('active_cases_count') or 0} active · "
+                                    f"{officer.get('total_assignments_count') or 0} assigned"
+                                ).classes('text-[10px] text-slate-500')
+
+            with ui.column().classes('flex-1 min-w-80 gap-4'):
+                if state['officer_id'] not in {o['id'] for o in everyone}:
+                    state['officer_id'] = visible[0]['id'] if visible else (everyone[0]['id'] if everyone else None)
+                if not state['officer_id']:
+                    with ui.card().classes('w-full p-8 bg-white border border-slate-200 rounded-3xl shadow-sm items-center gap-2'):
+                        ui.icon('person_search', size='lg').classes('text-slate-300')
+                        ui.label('Select an officer to review their account.').classes('text-xs font-bold text-slate-600')
+                else:
+                    _officer_detail(get_admin_officer_record(state['officer_id'], user), user, decide)
+
+    with portal_page(
+        'admin', '/admin/officers', 'Police Officer Verification',
+        'Review officer identities and credentials, verify or suspend accounts, and open the FIR cases each officer holds.',
+    ):
+        with ui.card().classes('w-full p-4 bg-white border border-slate-200 rounded-2xl shadow-sm'):
+            with ui.row().classes('w-full items-center gap-3 flex-wrap'):
+                search = ui.input(
+                    placeholder='Search by officer name, badge, rank, station, district or email…',
+                ).props('outlined dense clearable').classes('flex-1 min-w-64 text-sm')
+
+                def on_search(event) -> None:
+                    state['query'] = event.value or ''
+                    directory.refresh()
+
+                search.on_value_change(on_search)
+                status_filter = ui.select(
+                    {'ALL': 'All accounts', 'ACTIVE': 'Verified & active',
+                     'PENDING_VERIFICATION': 'Pending verification', 'SUSPENDED': 'Suspended'},
+                    value='ALL', label='Account status',
+                ).props('outlined dense').classes('min-w-48 text-xs')
+
+                def on_status(event) -> None:
+                    state['status'] = event.value or 'ALL'
+                    directory.refresh()
+
+                status_filter.on_value_change(on_status)
+                ui.button('Refresh', icon='refresh', on_click=directory.refresh).props(
+                    'outline no-caps size=sm').classes('text-indigo-800 font-bold')
+
+        directory()
+        _mon_listen(directory)
+        ui.timer(30, directory.refresh)
 
 
 # ==========================================
@@ -312,6 +592,7 @@ def admin_assignments_page() -> None:
 # 4. MAIN OFFICER FIR MANAGEMENT & TRACKING
 # ==========================================
 
+@ui.page('/admin/fir-cases')
 @ui.page('/admin/fir-management')
 @ui.page('/admin/fir-monitor')
 def admin_fir_management_page(fir_id: Optional[str] = None) -> None:
@@ -382,6 +663,11 @@ def admin_fir_management_page(fir_id: Optional[str] = None) -> None:
                                 ui.label(f"Tracking Ref: {fir.get('reference_number')} · Police Station: {fir.get('police_station')}").classes('text-xs text-slate-600')
 
                         with ui.row().classes('items-center gap-2 flex-wrap'):
+                            ui.button(
+                                'Complete Case Dossier (15-Point Audit) 📜',
+                                icon='history_edu',
+                                on_click=lambda fid=cur_fir_id: ui.navigate.to(f'/admin/fir-cases/{fid}/full')
+                            ).props('unelevated size=sm').classes('bg-indigo-900 hover:bg-indigo-950 text-white font-bold rounded-xl text-xs px-3 py-1.5 shadow-sm')
                             ui.badge(f"Record Version: v{fir.get('current_version', 1)}").classes('bg-blue-100 text-blue-900 border border-blue-300 font-mono font-bold text-xs px-3 py-1')
                             if bc_info.get('is_valid'):
                                 ui.badge('✓ Cryptographically Verified').classes('bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-xs px-3 py-1')
@@ -390,8 +676,17 @@ def admin_fir_management_page(fir_id: Optional[str] = None) -> None:
 
                     # Meta Information Grid
                     with ui.row().classes('w-full flex-wrap gap-6 pt-4 text-xs'):
+                        with ui.column().classes('gap-0 min-w-36 flex-1'):
+                            ui.label('Complainant Name').classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                            if fir.get('citizen_id'):
+                                ui.link(
+                                    fir.get('citizen_name', 'Citizen'),
+                                    f"/admin/citizens/{fir.get('citizen_id')}"
+                                ).classes('font-bold text-indigo-800 hover:underline break-words')
+                            else:
+                                ui.label(fir.get('citizen_name', 'Citizen')).classes('font-bold text-slate-800 break-words')
+
                         for label, val in [
-                            ('Complainant Name', fir.get('citizen_name', 'Citizen')),
                             ('Complainant Phone', fir.get('citizen_phone', '—')),
                             ('Complainant Email', fir.get('citizen_email', '—')),
                             ('Assigned Officer', f"{fir.get('officer_name', 'Unassigned')} ({fir.get('officer_badge', 'No Badge')})"),
@@ -627,10 +922,391 @@ def admin_fir_management_page(fir_id: Optional[str] = None) -> None:
         render_detail_view()
 
 
+@ui.page('/admin/fir-cases/{fir_id}')
 @ui.page('/admin/fir-management/{fir_id}')
 def admin_fir_management_param_page(fir_id: str) -> None:
     """Route support for direct FIR management link with path parameter."""
     return admin_fir_management_page(fir_id=fir_id)
+
+
+# ==========================================
+# 4B. CENTRALIZED FIR CASE VIEW (15-Point Master Spec)
+# ==========================================
+
+@ui.page('/admin/fir-cases/{fir_id}/full')
+@ui.page('/admin/fir-case/{fir_id}/full')
+def admin_fir_case_full_history_page(fir_id: str) -> None:
+    """
+    Centralized FIR Case View — Complete End-to-End Case Record.
+    Authorized Officers and Administrators inspect all 15 audit points on one organized page:
+    1. Citizen registration details and username
+    2. Citizen application date
+    3. Identity verification date and approving officer
+    4. Original complaint details and submission date
+    5. Complaint reference and official FIR number
+    6. FIR registration date and Verification Officer details
+    7. Original FIR document and all generated versions
+    8. Assigned Police Officer and assignment date
+    9. Investigation progress and status history
+    10. Every change made by the Verification Officer
+    11. Every change made by the Police Officer
+    12. Previous and current FIR versions
+    13. SHA-256 hashes for every recorded version
+    14. Complete audit timestamps and responsible officer details
+    15. Current case status and closure information
+    """
+    user = require_admin_user()
+    if not user:
+        return
+
+    try:
+        hist = get_complete_fir_case_history(fir_id, user)
+    except Exception as exc:
+        with portal_page('admin', '/admin/fir-cases', 'Case Not Found', 'Error loading FIR case record.'):
+            ui.label(f"Could not load complete case record: {exc}").classes('text-red-600 font-bold p-6')
+            ui.button('← Back to FIR Cases', on_click=lambda: ui.navigate.to('/admin/fir-cases')).classes('mt-4')
+        return
+
+    fir = hist['fir']
+    citizen = hist['citizen']
+    application = hist['application']
+    complaint = hist['complaint']
+    reg_info = hist['registration_info']
+    docs = hist['documents']
+    curr_assign = hist['current_assignment']
+    all_assign = hist['assignments']
+    tracking = hist['tracking_history']
+    vo_changes = hist['verification_officer_changes']
+    po_changes = hist['police_officer_changes']
+    versions = hist['versions']
+    closure = hist['closure_info']
+    integrity = hist['integrity_verification']
+
+    actual_fir_id = fir['id']
+    fir_num = fir.get('fir_number', '—')
+
+    with portal_page(
+        'admin',
+        '/admin/fir-cases',
+        f'Centralized Case Record: {fir_num}',
+        f'End-to-end statutory FIR dossier and cryptographic audit history for {fir_num}.'
+    ):
+        # Top Navigation & Quick Actions
+        with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-4 flex-wrap gap-3'):
+            ui.button(
+                '← Back to FIR Cases List',
+                icon='arrow_back',
+                on_click=lambda: ui.navigate.to(f'/admin/fir-cases?fir_id={actual_fir_id}')
+            ).props('flat size=sm').classes('text-slate-700 font-bold rounded-xl text-xs')
+
+            with ui.row().classes('items-center gap-2 flex-wrap'):
+                ui.button(
+                    'Interactive Tracking & Stage Update ⚙️',
+                    icon='tune',
+                    on_click=lambda: ui.navigate.to(f'/admin/fir-management/{actual_fir_id}')
+                ).props('unelevated outline size=sm').classes('text-indigo-800 font-bold rounded-xl text-xs')
+                ui.button(
+                    'Blockchain Explorer 🔗',
+                    icon='toll',
+                    on_click=lambda: ui.navigate.to('/admin/blockchain')
+                ).props('unelevated outline size=sm').classes('text-slate-700 font-bold rounded-xl text-xs')
+
+        # ── MASTER SUMMARY BANNER ──────────────────────────────────────────────
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
+            with ui.row().classes('w-full items-center justify-between flex-wrap gap-4 pb-4 border-b border-slate-200'):
+                with ui.row().classes('items-center gap-4'):
+                    with ui.element('div').classes('w-14 h-14 rounded-2xl flex items-center justify-center bg-indigo-50 text-indigo-900 border border-indigo-200 shadow-sm'):
+                        ui.icon('policy', size='md')
+                    with ui.column().classes('gap-1'):
+                        with ui.row().classes('items-center gap-2 flex-wrap'):
+                            ui.label(fir_num).classes('text-2xl font-black text-slate-900 font-mono tracking-tight')
+                            fir_status_badge(fir.get('status'))
+                            ui.badge(f"Version v{fir.get('current_version', 1)}").classes('bg-blue-100 text-blue-900 border border-blue-300 font-mono font-bold text-xs px-2.5 py-0.5 rounded-full')
+                        ui.label(
+                            f"Complaint Ref: {complaint.get('reference') or fir.get('reference_number', '—')} · Police Station: {fir.get('police_station', '—')} · Registered: {_mon_fmt(fir.get('created_at'))}"
+                        ).classes('text-xs text-slate-600')
+                with ui.row().classes('items-center gap-2 flex-wrap'):
+                    if integrity.get('is_valid'):
+                        ui.badge('✓ Cryptographically Verified').classes('bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-xs px-3 py-1 rounded-full')
+                    else:
+                        ui.badge('⚠️ Integrity Alert').classes('bg-rose-100 text-rose-900 border border-rose-300 font-bold text-xs px-3 py-1 rounded-full')
+
+        # ── SECTION 1, 2, 3: CITIZEN IDENTITY, APPLICATION & VERIFICATION ──────
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('badge', size='sm').classes('text-emerald-700')
+                    ui.label('1. Citizen Registration, Application & Identity Verification').classes('text-base font-black text-slate-900 fantasy-title')
+                if citizen.get('id'):
+                    ui.button(
+                        'View Full Citizen Dossier 👥',
+                        icon='open_in_new',
+                        on_click=lambda cid=citizen.get('id'): ui.navigate.to(f'/admin/citizens/{cid}')
+                    ).props('flat size=xs').classes('text-emerald-700 font-bold')
+
+            with ui.row().classes('w-full flex-wrap gap-4 text-xs'):
+                _mon_detail('Full Legal Name', citizen.get('name') or 'Citizen')
+                with ui.column().classes('gap-0 min-w-36 flex-1'):
+                    ui.label('Generated Username').classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                    if citizen.get('username'):
+                        ui.link(f"@{citizen.get('username')}", f"/admin/citizens/{citizen.get('id')}").classes('font-bold text-indigo-700 font-mono hover:underline')
+                    else:
+                        ui.label('Not issued yet').classes('font-bold text-slate-500 italic')
+                _mon_detail('Contact Mobile', citizen.get('phone'), mono=True)
+                _mon_detail('Registered Email', citizen.get('email'), mono=True)
+                _mon_detail('Gov ID Proof', application.get('gov_id_masked') or citizen.get('gov_id_masked'), mono=True)
+                _mon_detail('District / Jurisdiction', citizen.get('district') or application.get('district'))
+                _mon_detail('Residential Address', citizen.get('address'))
+
+            ui.separator().classes('my-3')
+            with ui.row().classes('w-full flex-wrap gap-4 text-xs'):
+                _mon_detail('Citizen Application Ref', application.get('reference') or '—', mono=True)
+                _mon_detail('Application Date & Time', _mon_fmt(application.get('submitted_at')), mono=True)
+                _mon_detail('Citizen Account Status', citizen.get('status') or 'ACTIVE')
+                _mon_detail('Identity Verification Date', _mon_fmt(application.get('reviewed_at') or citizen.get('verified_at')), mono=True)
+                _mon_detail('Approving Verification Officer', application.get('reviewed_by_name') or 'Authorized Verification Desk')
+                _mon_detail('Verification Decision', application.get('status') or citizen.get('verification_status') or 'VERIFIED')
+
+        # ── SECTION 4, 5, 6: COMPLAINT DETAILS & FORMAL FIR REGISTRATION ────────
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
+            with ui.row().classes('items-center gap-2 pb-3 border-b border-slate-200 mb-3'):
+                ui.icon('assignment', size='sm').classes('text-blue-800')
+                ui.label('2. Original Complaint Details & Formal FIR Registration').classes('text-base font-black text-slate-900 fantasy-title')
+
+            with ui.row().classes('w-full flex-wrap gap-4 text-xs'):
+                _mon_detail('Original Complaint Reference', complaint.get('reference') or fir.get('reference_number'), mono=True)
+                _mon_detail('Complaint Submission Date', _mon_fmt(complaint.get('submitted_at') or fir.get('created_at')), mono=True)
+                _mon_detail('Incident Category / Type', complaint.get('category') or fir.get('incident_type'))
+                _mon_detail('Incident Date & Time', f"{fir.get('incident_date', '—')} {fir.get('incident_time', '')}")
+                _mon_detail('Incident Location', complaint.get('location') or fir.get('incident_location'))
+                _mon_detail('Accused Details (if named)', complaint.get('accused_details') or 'Not specified')
+
+            # Original Complaint Statement
+            with ui.column().classes('w-full mt-3 p-3 bg-slate-50 border border-slate-200 rounded-2xl'):
+                ui.label('Original Complaint Statement:').classes('text-[10px] font-black text-slate-500 uppercase tracking-wider mb-1')
+                ui.label(complaint.get('description') or fir.get('description') or 'No narrative text recorded.').classes('text-xs text-slate-800 leading-relaxed')
+
+            ui.separator().classes('my-3')
+            # Formal FIR Registration Particulars
+            with ui.row().classes('w-full flex-wrap gap-4 text-xs'):
+                _mon_detail('Official FIR Number', fir_num, mono=True)
+                _mon_detail('Formal Registration Date & Time', _mon_fmt(reg_info.get('registered_at')), mono=True)
+                _mon_detail('Police Station of Record', reg_info.get('police_station'))
+                _mon_detail('Registering Verification Officer', reg_info.get('officer_name'))
+                _mon_detail('Officer Badge / ID', reg_info.get('officer_badge'), mono=True)
+                _mon_detail('Officer Station Jurisdiction', reg_info.get('officer_station'))
+
+        # ── SECTION 7: ORIGINAL & VERSIONED FIR DOCUMENTS ──────────────────────
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('picture_as_pdf', size='sm').classes('text-rose-700')
+                    ui.label(f"3. Official FIR Documents & Generated Versions ({len(docs)})").classes('text-base font-black text-slate-900 fantasy-title')
+                ui.badge(f"{len(docs)} Document Copies Archived").classes('bg-rose-50 text-rose-800 border border-rose-200 font-bold text-[10px] px-2 py-0.5 rounded-full')
+
+            if docs:
+                with ui.column().classes('w-full gap-2'):
+                    for d in docs:
+                        with ui.card().classes('w-full p-3 bg-slate-50 border border-slate-200 rounded-2xl flex-row items-center justify-between gap-3 flex-wrap'):
+                            with ui.row().classes('items-center gap-3'):
+                                with ui.element('div').classes('w-10 h-10 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center font-bold text-xs'):
+                                    ui.label(f"v{d.get('version')}")
+                                with ui.column().classes('gap-0'):
+                                    ui.label(d.get('file_name') or f"FIR_{fir_num}_v{d.get('version')}.pdf").classes('text-xs font-black text-slate-900 font-mono')
+                                    ui.label(
+                                        f"Generated {_mon_fmt(d.get('generated_at'))} · SHA-256: {str(d.get('sha256') or '—')[:16]}..."
+                                    ).classes('text-[10px] text-slate-500 font-mono')
+                            ui.button(
+                                'Download Verified PDF 📥',
+                                icon='download',
+                                on_click=lambda url=d.get('download_url'): ui.navigate.to(url, new_tab=True)
+                            ).props('unelevated size=sm').classes('bg-rose-700 hover:bg-rose-800 text-white font-bold rounded-xl text-xs px-3 py-1')
+            else:
+                ui.label('FIR document generation in progress or rendered on demand from official record.').classes('text-xs text-slate-400 italic py-2')
+
+        # ── SECTION 8: ASSIGNED POLICE OFFICER & ASSIGNMENT TRAIL ──────────────
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('assignment_ind', size='sm').classes('text-indigo-800')
+                    ui.label('4. Assigned Investigating Officer & Assignment Trail').classes('text-base font-black text-slate-900 fantasy-title')
+                if curr_assign:
+                    ui.badge('Active Assignment').classes('bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[10px] px-2 py-0.5 rounded-full')
+                else:
+                    ui.badge('Pending Officer Assignment').classes('bg-amber-100 text-amber-900 border border-amber-300 font-bold text-[10px] px-2 py-0.5 rounded-full')
+
+            if curr_assign:
+                with ui.row().classes('w-full flex-wrap gap-4 text-xs'):
+                    _mon_detail('Investigating Officer Name', curr_assign.get('officer_name'))
+                    _mon_detail('Officer Badge / ID', curr_assign.get('officer_badge'), mono=True)
+                    _mon_detail('Rank / Designation', curr_assign.get('officer_rank'))
+                    _mon_detail('Police Station', curr_assign.get('officer_station'))
+                    _mon_detail('Officer Contact Phone', curr_assign.get('officer_phone'), mono=True)
+                    _mon_detail('Assignment Date & Time', _mon_fmt(curr_assign.get('assigned_at')), mono=True)
+                    _mon_detail('Assigned By Officer', f"{curr_assign.get('assigner_name', 'Verification Desk')} ({curr_assign.get('assigner_badge', 'N/A')})")
+            else:
+                ui.label('No investigating officer is currently assigned to this FIR.').classes('text-xs text-slate-500 italic py-2')
+
+            if len(all_assign) > 1:
+                ui.label('Historical Assignment Chain:').classes('text-[10px] font-black text-slate-500 uppercase tracking-wider mt-3 mb-1')
+                with ui.column().classes('w-full gap-1'):
+                    for a in all_assign:
+                        with ui.row().classes('w-full items-center justify-between p-2 rounded-xl bg-slate-50 text-[11px]'):
+                            ui.label(f"{a.get('officer_name')} ({a.get('officer_badge')}) · Assigned {_mon_fmt(a.get('assigned_at'))} by {a.get('assigner_name') or 'Verification Desk'}").classes('text-slate-800')
+                            ui.badge(a.get('status', 'ACTIVE')).classes('bg-slate-200 text-slate-700 text-[9px] font-bold')
+
+        # ── SECTION 9: 10-STAGE INVESTIGATION PROGRESSION ──────────────────────
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('timeline', size='sm').classes('text-blue-700')
+                    ui.label(f"5. Investigation Progress & 10-Stage Tracking Timeline ({len(tracking)} Entries)").classes('text-base font-black text-slate-900 fantasy-title')
+                ui.badge(f"Current: {STAGE_LABELS.get(fir.get('current_stage'), fir.get('status', 'UNDER_INVESTIGATION'))}").classes('bg-blue-100 text-blue-900 border border-blue-300 font-bold text-xs px-3 py-1 rounded-full')
+
+            if tracking:
+                with ui.column().classes('w-full gap-3 mt-2'):
+                    for idx, tr in enumerate(tracking):
+                        stage_key = tr.get('new_stage', '')
+                        st_colour = ADMIN_STAGE_COLOURS.get(stage_key, 'bg-slate-100 text-slate-800 border-slate-200')
+                        with ui.card().classes('w-full p-3 rounded-2xl border border-slate-200 bg-slate-50/70 gap-1'):
+                            with ui.row().classes('w-full items-center justify-between flex-wrap gap-2'):
+                                with ui.row().classes('items-center gap-2'):
+                                    with ui.element('div').classes('w-6 h-6 rounded-full bg-blue-900 text-white flex items-center justify-center font-bold text-[10px]'):
+                                        ui.label(str(idx + 1))
+                                    ui.badge(STAGE_LABELS.get(stage_key, stage_key)).classes(f'border font-bold text-xs px-2.5 py-0.5 rounded-full {st_colour}')
+                                    if tr.get('action'):
+                                        ui.badge(tr.get('action')).classes('bg-slate-200 text-slate-700 font-mono text-[9px] px-1.5 rounded')
+                                ui.label(_mon_fmt(tr.get('timestamp'))).classes('text-[11px] font-mono text-slate-500')
+                            with ui.row().classes('w-full items-center gap-3 text-xs mt-1'):
+                                ui.label(f"Updated by: {tr.get('updated_by_officer_name')} (Badge: {tr.get('updated_by_officer_badge')})").classes('text-slate-700 font-semibold')
+                            if tr.get('public_note'):
+                                with ui.row().classes('w-full items-start gap-2 mt-1 p-2 bg-white border border-slate-200 rounded-xl text-xs'):
+                                    ui.icon('public', size='xs').classes('text-emerald-700 pt-0.5')
+                                    with ui.column().classes('gap-0 flex-1'):
+                                        ui.label('Citizen-Visible Update:').classes('text-[9px] font-black text-emerald-800 uppercase')
+                                        ui.label(tr.get('public_note')).classes('text-slate-800')
+                            if tr.get('remarks'):
+                                with ui.row().classes('w-full items-start gap-2 mt-1 p-2 bg-indigo-50/50 border border-indigo-100 rounded-xl text-xs'):
+                                    ui.icon('lock', size='xs').classes('text-indigo-700 pt-0.5')
+                                    with ui.column().classes('gap-0 flex-1'):
+                                        ui.label('Internal Police & Admin Remarks:').classes('text-[9px] font-black text-indigo-800 uppercase')
+                                        ui.label(tr.get('remarks')).classes('text-slate-700 italic')
+            else:
+                ui.label('Case tracking initialization pending or complaint awaiting formal review.').classes('text-xs text-slate-400 italic py-2')
+
+        # ── SECTION 10 & 11: VERIFICATION & POLICE OFFICER AUDIT MODIFICATIONS ──
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('history_edu', size='sm').classes('text-amber-700')
+                    ui.label('6. Authorized Modifications & Before/After Value Differences').classes('text-base font-black text-slate-900 fantasy-title')
+                ui.badge(
+                    f"{len(vo_changes)} by Verification Desk · {len(po_changes)} by Police Officer"
+                ).classes('bg-amber-50 text-amber-900 border border-amber-300 font-bold text-xs px-2.5 py-1 rounded-full')
+
+            all_changes_combined = [('VERIFICATION OFFICER', vo_changes), ('POLICE INVESTIGATING OFFICER', po_changes)]
+            has_any_change = False
+
+            for role_group_title, change_list in all_changes_combined:
+                if change_list:
+                    has_any_change = True
+                    ui.label(f"Changes by {role_group_title} ({len(change_list)} Event(s)):").classes('text-xs font-black text-slate-700 uppercase tracking-wider mt-3 mb-2')
+                    with ui.column().classes('w-full gap-3'):
+                        for ev in change_list:
+                            diffs = ev.get('diffs', [])
+                            with ui.card().classes('w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl shadow-xs'):
+                                with ui.row().classes('w-full items-center justify-between pb-2 border-b border-slate-200 flex-wrap gap-2'):
+                                    with ui.row().classes('items-center gap-2'):
+                                        ui.badge(f"Event #{ev.get('event_number')}").classes('bg-blue-900 text-white font-mono text-[10px]')
+                                        ui.label(f"Version: v{ev.get('previous_version')} → v{ev.get('new_version')}").classes('font-bold text-slate-900 text-xs font-mono')
+                                    with ui.row().classes('items-center gap-3 text-[11px] font-mono text-slate-600'):
+                                        ui.label(f"Officer: {ev.get('actor_name')} ({ev.get('actor_badge', 'N/A')})")
+                                        ui.label(f"Date: {_mon_fmt(ev.get('timestamp'))} {ev.get('timezone', '')}")
+
+                                if ev.get('reason'):
+                                    ui.label(f"Reason: {ev.get('reason')}").classes('text-xs text-slate-600 italic mt-2')
+
+                                if diffs:
+                                    ui.label('Modified Information:').classes('text-[10px] font-black text-slate-400 uppercase tracking-wider mt-2 mb-1')
+                                    with ui.column().classes('w-full gap-2'):
+                                        for d in diffs:
+                                            with ui.row().classes('w-full items-start gap-2 text-xs flex-wrap'):
+                                                ui.label(d['field'].replace('_', ' ').title()).classes('font-black text-slate-700 min-w-36 pt-1')
+                                                with ui.element('div').classes('flex-1 min-w-44 p-2 bg-rose-50 border border-rose-200 rounded-xl text-rose-900'):
+                                                    ui.label(f"Previous: {d.get('old_value') or '(empty)'}").classes('text-xs break-words')
+                                                ui.icon('arrow_forward', size='xs').classes('text-slate-400 pt-2')
+                                                with ui.element('div').classes('flex-1 min-w-44 p-2 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900'):
+                                                    ui.label(f"Updated: {d.get('new_value') or '(empty)'}").classes('text-xs break-words')
+
+            if not has_any_change:
+                ui.label('No statutory modifications have been made to this FIR record. The file remains in its initial genesis version.').classes('text-xs text-slate-500 italic py-2')
+
+        # ── SECTION 12, 13, 14: RECORD VERSIONS, SHA-256 HASHES & BLOCKCHAIN ───
+        with ui.card().classes('w-full p-6 paper-card bg-slate-950 text-white border border-slate-800 rounded-3xl shadow-xl mb-4'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-800 flex-wrap gap-2'):
+                with ui.row().classes('items-center gap-3'):
+                    with ui.element('div').classes('w-10 h-10 rounded-xl bg-indigo-900 text-indigo-300 flex items-center justify-center font-bold'):
+                        ui.icon('toll', size='sm')
+                    with ui.column().classes('gap-0'):
+                        ui.label('7. Cryptographic SHA-256 Hashes & Blockchain Ledger Trail').classes('text-base font-black text-white fantasy-title')
+                        ui.label('Complete immutable cryptographic hash chain and PoA consensus transaction records.').classes('text-xs text-slate-400')
+                ui.badge(f"{len(versions)} Recorded Version(s)").classes('bg-indigo-900 text-indigo-200 border border-indigo-700 font-bold text-xs px-2.5 py-0.5 rounded-full')
+
+            with ui.column().classes('w-full gap-3 mt-3'):
+                for v in versions:
+                    with ui.card().classes('w-full p-4 bg-slate-900 border border-slate-800 rounded-2xl'):
+                        with ui.row().classes('w-full items-center justify-between pb-2 border-b border-slate-800 flex-wrap gap-2'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.badge(f"Version v{v.get('version_number')}").classes('bg-blue-600 text-white font-mono font-bold text-xs')
+                                ui.label(f"Recorded: {_mon_fmt(v.get('created_at'))}").classes('text-xs text-slate-400 font-mono')
+                            with ui.row().classes('items-center gap-2'):
+                                ui.label(f"Officer: {v.get('created_by_name')} ({v.get('created_by_badge', 'N/A')})").classes('text-xs text-slate-300')
+                                ui.badge(v.get('blockchain_status', 'VERIFIED')).classes('bg-emerald-950 text-emerald-300 border border-emerald-800 text-[10px] font-bold')
+
+                        with ui.column().classes('w-full gap-1 mt-2 text-xs font-mono'):
+                            with ui.row().classes('w-full items-center justify-between gap-2'):
+                                ui.label('Current SHA-256 Canonical Hash:').classes('text-[10px] text-emerald-400 uppercase font-sans font-bold')
+                            ui.label(v.get('current_hash', '—')).classes('text-xs text-emerald-300 break-all font-mono')
+
+                            if v.get('previous_hash'):
+                                with ui.row().classes('w-full items-center justify-between gap-2 mt-1'):
+                                    ui.label('Previous Version Hash:').classes('text-[10px] text-slate-400 uppercase font-sans font-bold')
+                                ui.label(v.get('previous_hash', '—')).classes('text-xs text-slate-400 break-all font-mono')
+
+                            with ui.row().classes('w-full items-center gap-4 mt-2 pt-2 border-t border-slate-800 text-[11px] text-indigo-300 flex-wrap'):
+                                ui.label(f"Block Index: #{v.get('blockchain_block', 1)}")
+                                ui.label(f"Tx Hash: {v.get('blockchain_tx_hash', '—')}")
+                                if v.get('change_reason'):
+                                    ui.label(f"Reason: {v.get('change_reason')}").classes('text-slate-300 italic')
+
+        # ── SECTION 15: CURRENT CASE STATUS & CLOSURE INFORMATION ──────────────
+        with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('verified_user', size='sm').classes('text-blue-900')
+                    ui.label('8. Current Case Status & Final Closure Audit').classes('text-base font-black text-slate-900 fantasy-title')
+                fir_status_badge(fir.get('status'))
+
+            if closure:
+                with ui.column().classes('w-full p-4 bg-emerald-50 border border-emerald-200 rounded-2xl gap-2'):
+                    ui.label('Case Formally Concluded & Closed').classes('text-sm font-black text-emerald-950')
+                    with ui.row().classes('w-full flex-wrap gap-4 text-xs'):
+                        _mon_detail('Closure Date & Time', _mon_fmt(closure.get('closed_at')), mono=True)
+                        _mon_detail('Closing Officer', closure.get('closing_officer'))
+                        _mon_detail('Closing Officer Badge', closure.get('closing_badge'), mono=True)
+                    with ui.column().classes('gap-0 mt-2'):
+                        ui.label('Final Closure Remarks / Court Findings:').classes('text-[10px] font-black text-emerald-900 uppercase')
+                        ui.label(closure.get('remarks') or 'Case closed.').classes('text-xs text-slate-800 italic')
+            else:
+                with ui.row().classes('w-full items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-2xl flex-wrap gap-3'):
+                    with ui.column().classes('gap-0'):
+                        ui.label('Active Investigation File').classes('text-xs font-black text-slate-900')
+                        ui.label(f"Case currently in stage: {STAGE_LABELS.get(fir.get('current_stage'), fir.get('status', 'UNDER_INVESTIGATION'))}").classes('text-xs text-slate-600')
+                    ui.button(
+                        'Update Case Progression ⚙️',
+                        icon='arrow_forward',
+                        on_click=lambda: ui.navigate.to(f'/admin/fir-management/{actual_fir_id}')
+                    ).props('unelevated size=sm').classes('bg-indigo-900 text-white font-bold rounded-xl text-xs px-3 py-1')
 
 
 # ==========================================
@@ -707,14 +1383,24 @@ def admin_citizens_page(citizen_id: Optional[str] = None) -> None:
                                 ui.label(f"Registered FIRs: {len(c_firs)}").classes('text-xs font-bold text-blue-800')
 
                     # Personal details grid
+                    application = get_application_by_citizen(cid) or {}
                     with ui.row().classes('w-full flex-wrap gap-6 pt-4 text-xs'):
                         for label, val in [
+                            ('Username', citizen.get('username') or 'Not issued yet'),
                             ('Email Address', citizen.get('email', '—')),
                             ('Phone Number', citizen.get('phone', '—')),
-                            ('Gov ID Proof', citizen.get('gov_id_masked') or '—'),
-                            ('District Jurisdiction', citizen.get('district') or '—'),
+                            ('Gov ID Proof', citizen.get('gov_id_masked') or application.get('gov_id_masked') or '—'),
+                            ('District Jurisdiction', citizen.get('district') or application.get('district') or '—'),
                             ('Residential Address', citizen.get('address') or '—'),
                             ('Registration Date', str(citizen.get('created_at', ''))[:19].replace('T', ' ')),
+                            ('Application Reference', application.get('reference') or '—'),
+                            ('Application Date', str(application.get('submitted_at') or '—')[:19].replace('T', ' ')),
+                            ('Identity Verification Date', str(
+                                application.get('reviewed_at') or citizen.get('verified_at') or '—'
+                            )[:19].replace('T', ' ')),
+                            ('Approving Officer', application.get('reviewed_by_name') or '—'),
+                            ('Verification Status', citizen.get('verification_status')
+                             or application.get('status') or '—'),
                         ]:
                             with ui.column().classes('gap-0 min-w-44 flex-1'):
                                 ui.label(label).classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
@@ -769,6 +1455,29 @@ def admin_citizens_page(citizen_id: Optional[str] = None) -> None:
                                             with ui.column().classes('gap-0'):
                                                 ui.label(lbl).classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
                                                 ui.label(str(v or '—')).classes('font-bold text-slate-800')
+
+                                    # §4D: the profile carries the audit and integrity
+                                    # detail an Authorized Officer is permitted to see.
+                                    versions = get_fir_versions(fid, actor_user=user)
+                                    changes = get_fir_changes(fid, actor_user=user)
+                                    chain = get_hash_chain_status(fid)
+                                    latest = versions[-1] if versions else {}
+                                    with ui.row().classes(
+                                        'w-full items-center gap-3 flex-wrap mt-3 pt-2 border-t border-slate-100'):
+                                        ui.label(
+                                            f"Audit: {len(versions)} version(s) · {len(changes)} recorded change(s)"
+                                            f" · last by {latest.get('creator_name') or '—'}"
+                                            f" ({str(latest.get('creator_role') or '').replace('_', ' ').title() or '—'})"
+                                            f" · {_mon_fmt(latest.get('created_at'))}"
+                                        ).classes('text-[10px] font-bold text-slate-600')
+                                        ui.badge(chain.get('status') or 'CHECKING').classes(
+                                            'bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[9px] px-1.5 rounded'
+                                            if chain.get('chain_valid') else
+                                            'bg-rose-100 text-rose-900 border border-rose-300 font-bold text-[9px] px-1.5 rounded')
+                                    if latest.get('current_hash'):
+                                        ui.label(
+                                            f"SHA-256 v{latest.get('version_number')}: {latest['current_hash']}"
+                                        ).classes('text-[9px] text-indigo-800 font-mono break-all mt-1')
                     else:
                         ui.label('No registered FIRs found for this citizen.').classes('text-xs text-slate-400 italic')
 
@@ -1250,6 +1959,7 @@ def admin_fir_audit_history_page(fir_id: str) -> None:
 ADMIN_CASE_EVENTS = (
     'NOTIFICATION_CREATED', 'FIR_UPDATED', 'CASE_STAGE_UPDATED',
     'INVESTIGATION_UPDATED', 'OFFICER_CREDITS_UPDATED', 'CHAT_MESSAGE',
+    'OFFICER_STATUS_UPDATED',
 )
 
 ADMIN_STAGE_COLOURS = {
@@ -1444,10 +2154,267 @@ def admin_investigations_page() -> None:
         ui.timer(30, monitor_view.refresh)
 
 
+def _mon_detail(label: str, value, *, mono: bool = False) -> None:
+    """One labelled value in an authorized record grid."""
+    with ui.column().classes('gap-0.5 min-w-40 flex-1'):
+        ui.label(label).classes('text-[10px] font-black text-slate-500 uppercase tracking-wider')
+        ui.label(str(value if value not in (None, '') else '—')).classes(
+            f"text-xs font-bold text-slate-900 {'font-mono break-all' if mono else ''}")
+
+
+def _render_case_origin(record: Dict[str, Any]) -> None:
+    """Citizen registration, identity approval, complaint origin and FIR registration."""
+    citizen = record.get('citizen') or {}
+    application = record.get('application') or {}
+    complaint = record.get('complaint') or {}
+    registration = record.get('registration') or {}
+    closure = record.get('closure') or {}
+    case = record.get('case') or {}
+    counts = record.get('counts') or {}
+
+    with ui.card().classes('w-full mt-6 p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'):
+        with ui.row().classes('items-center gap-2 pb-3 border-b border-slate-100 mb-4 flex-wrap'):
+            ui.icon('badge', size='sm').classes('text-emerald-700')
+            ui.label('Case Origin & Registration Record').classes(
+                'text-base font-bold text-slate-900 fantasy-title')
+            ui.badge('Authorized Officer view').classes(
+                'bg-emerald-50 text-emerald-800 border border-emerald-200 font-bold text-[10px] px-2 rounded-full')
+
+        with ui.row().classes('w-full items-center gap-3 flex-wrap'):
+            ui.label(citizen.get('name') or case.get('citizen_name') or 'Citizen not recorded').classes(
+                'text-sm font-black text-slate-900')
+            if citizen.get('username'):
+                def open_citizen_profile(target_id=citizen.get('id')):
+                    ui.navigate.to(f'/admin/citizens/{target_id}')
+
+                ui.button(str(citizen['username']), icon='account_circle',
+                          on_click=open_citizen_profile).props('outline dense size=sm no-caps').classes(
+                    'text-emerald-800 font-bold border-emerald-300 font-mono')
+                ui.label('Click the username for the full citizen profile and case history.').classes(
+                    'text-[10px] text-slate-400')
+            else:
+                ui.badge('USERNAME NOT ISSUED').classes(
+                    'bg-slate-100 text-slate-600 border border-slate-200 font-bold text-[10px] px-2 rounded-full')
+
+        with ui.row().classes('w-full flex-wrap gap-4 mt-4'):
+            with ui.column().classes('gap-3 w-full'):
+                ui.label('Citizen registration & identity verification').classes(
+                    'text-[11px] font-black text-slate-700')
+                with ui.row().classes('w-full flex-wrap gap-4'):
+                    _mon_detail('Registration Date', _mon_fmt(citizen.get('created_at')))
+                    _mon_detail('Application Reference', application.get('reference'))
+                    _mon_detail('Application Date', _mon_fmt(application.get('submitted_at')))
+                    _mon_detail('Application Status', application.get('status'))
+                with ui.row().classes('w-full flex-wrap gap-4'):
+                    _mon_detail('Identity Verified On', _mon_fmt(
+                        application.get('reviewed_at') or citizen.get('verified_at')))
+                    _mon_detail('Approving Officer', application.get('reviewed_by_name') or '—')
+                    _mon_detail('Verification Status', citizen.get('verification_status') or '—')
+                    _mon_detail('Government ID', citizen.get('gov_id_masked') or application.get('gov_id_masked'))
+                    _mon_detail('Records On File',
+                                f"{counts.get('complaints', 0)} complaint(s) · {counts.get('firs', 0)} FIR(s)")
+
+            with ui.column().classes('gap-3 w-full'):
+                ui.label('Original complaint & official registration').classes(
+                    'text-[11px] font-black text-slate-700')
+                with ui.row().classes('w-full flex-wrap gap-4'):
+                    _mon_detail('Complaint Reference (not the FIR number)', complaint.get('reference'), mono=True)
+                    _mon_detail('Complaint Submitted', _mon_fmt(complaint.get('submitted_at')))
+                    _mon_detail('Complaint Category', complaint.get('category') or case.get('incident_type'))
+                    _mon_detail('Verified By', f"{complaint.get('verified_by_name') or '—'} · "
+                                               f"{_mon_fmt(complaint.get('verified_at'))}")
+                with ui.row().classes('w-full flex-wrap gap-4'):
+                    _mon_detail('Official FIR Number', case.get('fir_number'), mono=True)
+                    _mon_detail('FIR Registered On', _mon_fmt(registration.get('created_at')))
+                    _mon_detail('Registering Verification Officer',
+                                f"{registration.get('officer_name') or 'Not recorded'}"
+                                f" · {str(registration.get('officer_role') or '').replace('_', ' ').title() or '—'}"
+                                + (f" · Badge {registration['officer_badge']}"
+                                   if registration.get('officer_badge') else ''))
+                    _mon_detail('Pre-registration Corrections',
+                                f"By {complaint.get('fir_edited_by_name')}"
+                                f" · {_mon_fmt(complaint.get('fir_edited_at'))}"
+                                if complaint.get('fir_edited_at') else 'None recorded')
+
+        if complaint.get('description'):
+            ui.label(str(complaint['description'])).classes(
+                'text-[11px] text-slate-700 leading-relaxed mt-4 whitespace-pre-line')
+
+        with ui.row().classes('w-full flex-wrap gap-4 mt-4 pt-3 border-t border-slate-100'):
+            _mon_detail('Current Case Status', case.get('status'))
+            _mon_detail('Current Stage', case.get('stage_label'))
+            if record.get('is_closed'):
+                _mon_detail('Closed On', _mon_fmt(closure.get('timestamp')))
+                _mon_detail('Closed By', f"{closure.get('updated_by_officer_name') or '—'}"
+                                         f" · Badge {closure.get('updated_by_officer_badge') or 'N/A'}")
+                _mon_detail('Closure Remarks', closure.get('remarks'))
+            else:
+                _mon_detail('Closure', 'Not closed — case is still under investigation')
+
+
+def _render_case_documents(user: Dict[str, Any], record: Dict[str, Any]) -> None:
+    """The FIR document and every version previously issued for this case."""
+    documents = record.get('documents') or []
+    with ui.card().classes('w-full mt-6 p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'):
+        with ui.row().classes('items-center gap-2 pb-3 border-b border-slate-100 mb-4 flex-wrap'):
+            ui.icon('description', size='sm').classes('text-blue-800')
+            ui.label('FIR Document & Generated Versions').classes(
+                'text-base font-bold text-slate-900 fantasy-title')
+            ui.badge(f"{len(documents)} version(s)").classes(
+                'bg-slate-100 text-slate-600 font-bold text-[10px] px-2 rounded-full')
+
+        if not documents:
+            ui.label('No FIR document has been generated for this case yet.').classes(
+                'text-xs text-slate-500')
+            return
+
+        with ui.column().classes('w-full gap-2'):
+            for document in documents:
+                with ui.row().classes(
+                    'w-full items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 bg-slate-50/60'):
+                    with ui.column().classes('gap-0.5 flex-1 min-w-0'):
+                        with ui.row().classes('items-center gap-2 flex-wrap'):
+                            ui.label(f"v{document.get('version')} · {document.get('file_name')}").classes(
+                                'text-xs font-black text-slate-900 font-mono truncate')
+                            if document.get('is_current'):
+                                ui.badge('CURRENT').classes(
+                                    'bg-emerald-100 text-emerald-800 font-bold text-[9px] px-1.5 rounded')
+                        ui.label(
+                            f"Generated by {document.get('generated_by_name') or 'Officer'} · "
+                            f"{_mon_fmt(document.get('generated_at'))}").classes('text-[10px] text-slate-500')
+                        if document.get('sha256'):
+                            ui.label(f"SHA-256 {document['sha256']}").classes(
+                                'text-[9px] text-slate-400 font-mono break-all')
+
+                    def open_document(entry=document):
+                        content = read_document_bytes(entry)
+                        if not content:
+                            ui.notify('The stored document is no longer available.', type='warning')
+                            return
+                        _mon_open_file(content, entry.get('file_name') or 'FIR.pdf', 'application/pdf')
+
+                    ui.button('Open', icon='visibility', on_click=open_document).props(
+                        'outline dense size=sm no-caps').classes('text-blue-800 font-bold border-blue-300')
+
+
+def _render_change_diffs(changes: List[Dict[str, Any]], empty_text: str) -> None:
+    """Previous value vs updated value, officer, date/time and optional reason."""
+    if not changes:
+        ui.label(empty_text).classes('text-[11px] text-slate-500')
+        return
+    with ui.column().classes('w-full gap-2'):
+        for event in changes:
+            with ui.card().classes('w-full p-3 rounded-2xl border border-slate-200 bg-slate-50/60'):
+                with ui.row().classes('w-full items-center justify-between gap-2 flex-wrap'):
+                    ui.label(f"{event.get('actor_name') or 'Officer'} · "
+                             f"{str(event.get('actor_role') or '').replace('_', ' ').title()}"
+                             + (f" · Badge {event['actor_badge']}" if event.get('actor_badge') else '')).classes(
+                        'text-[11px] font-black text-slate-900')
+                    ui.label(_mon_fmt(event.get('timestamp'))).classes(
+                        'text-[9px] text-slate-400 font-mono shrink-0')
+                for diff in event.get('diffs') or []:
+                    with ui.row().classes('w-full items-start gap-2 flex-wrap mt-1'):
+                        ui.label(diff.get('label')).classes(
+                            'text-[10px] font-black text-slate-600 min-w-40 uppercase tracking-wider')
+                        ui.label(f"Previous: {diff.get('old') or '—'}").classes(
+                            'text-[11px] text-rose-700 line-through decoration-rose-300')
+                        ui.icon('arrow_right', size='xs').classes('text-slate-400 mt-0.5')
+                        ui.label(f"Updated: {diff.get('new') or '—'}").classes('text-[11px] font-bold text-emerald-800')
+                ui.label(
+                    f"Reason: {event.get('reason') or 'No reason recorded'} · "
+                    f"v{event.get('previous_version')} → v{event.get('new_version')}").classes(
+                    'text-[10px] text-slate-500 mt-1')
+
+
+def _render_modifications_and_hashes(record: Dict[str, Any]) -> None:
+    """Audit trail with every recorded modification and the SHA-256 hash of each version."""
+    versions = record.get('versions') or []
+    chain = record.get('chain') or {}
+    verification_events = record.get('verification_events') or []
+
+    with ui.column().classes('w-full gap-4 mt-6'):
+        with ui.card().classes('w-full p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'):
+            with ui.row().classes('items-center gap-2 pb-3 border-b border-slate-100 mb-4 flex-wrap'):
+                ui.icon('edit_document', size='sm').classes('text-indigo-800')
+                ui.label('Modifications Made on This Case').classes(
+                    'text-base font-bold text-slate-900 fantasy-title')
+                ui.badge('Confidential audit view').classes(
+                    'bg-red-50 text-red-700 border border-red-200 font-bold text-[10px] px-2 rounded-full')
+
+            ui.label('Verification Officer actions').classes('text-[11px] font-black text-slate-700 mb-2')
+            if verification_events:
+                with ui.column().classes('w-full gap-1 mb-4'):
+                    for event in verification_events:
+                        with ui.row().classes('w-full items-start gap-3 text-[11px]'):
+                            ui.label(vo_action_label(event.get('action'))).classes(
+                                'font-black text-blue-900 min-w-56')
+                            ui.label(str(event.get('remarks') or '—')).classes(
+                                'text-slate-700 flex-1 whitespace-pre-line')
+                            ui.label(
+                                f"{event.get('actor_name') or '—'} · {_mon_fmt(event.get('created_at'))}").classes(
+                                'text-[9px] text-slate-400 font-mono shrink-0')
+            else:
+                ui.label('No verification actions recorded for the source complaint.').classes(
+                    'text-[11px] text-slate-500 mb-4')
+
+            _render_change_diffs(record.get('verification_changes') or [],
+                                 'No Verification Officer amendment of a registered FIR is recorded.')
+            ui.separator().classes('my-4')
+            ui.label('Police Officer amendments').classes('text-[11px] font-black text-slate-700 mb-2')
+            _render_change_diffs(record.get('officer_changes') or [],
+                                 'No police officer has amended the registered FIR details.')
+
+        with ui.card().classes('w-full p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'):
+            with ui.row().classes('items-center gap-2 pb-3 border-b border-slate-100 mb-4 flex-wrap'):
+                ui.icon('key', size='sm').classes('text-slate-700')
+                ui.label('Version History & SHA-256 Integrity').classes(
+                    'text-base font-bold text-slate-900 fantasy-title')
+                ui.badge('Authorized Officer only').classes(
+                    'bg-slate-100 text-slate-700 border border-slate-200 font-bold text-[10px] px-2 rounded-full')
+                ui.badge(str(chain.get('status') or 'CHECKING')).classes(
+                    'bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[10px] px-2 rounded-full'
+                    if chain.get('chain_valid') else
+                    'bg-rose-100 text-rose-900 border border-rose-300 font-bold text-[10px] px-2 rounded-full')
+
+            if not versions:
+                ui.label('No immutable versions have been recorded for this case.').classes(
+                    'text-xs text-slate-500')
+            else:
+                with ui.column().classes('w-full gap-2'):
+                    for version in versions:
+                        with ui.card().classes(
+                            'w-full p-3 rounded-2xl border border-slate-200 bg-slate-50/60 gap-1'):
+                            with ui.row().classes('w-full items-center justify-between gap-2 flex-wrap'):
+                                ui.label(
+                                    f"Version {version.get('version_number')}"
+                                    + (' — original' if version.get('version_number') == 1 else '')).classes(
+                                    'text-xs font-black text-slate-900')
+                                ui.label(_mon_fmt(version.get('created_at'))).classes(
+                                    'text-[9px] text-slate-400 font-mono')
+                            ui.label(
+                                f"{version.get('creator_name') or 'Unknown'} · "
+                                f"{str(version.get('creator_role') or '').replace('_', ' ').title() or '—'}"
+                                + (f" · Badge {version['creator_badge']}" if version.get('creator_badge') else '')
+                                + f" · Reason: {version.get('change_reason') or 'No reason recorded'}").classes(
+                                'text-[10px] text-slate-600')
+                            ui.label(
+                                f"Previous hash: {version.get('previous_hash') or '— (initial version)'}").classes(
+                                'text-[9px] text-slate-400 font-mono break-all')
+                            ui.label(f"SHA-256: {version.get('current_hash') or '—'}").classes(
+                                'text-[9px] text-indigo-800 font-mono break-all')
+
+                ui.label(
+                    f"{chain.get('message') or ''} · {len(versions)} version(s) recorded · "
+                    f"latest v{versions[-1].get('version_number')}").classes('text-[10px] text-slate-500 mt-3')
+                for issue in chain.get('issues') or []:
+                    ui.label(f"⚠ {issue.get('message')}").classes('text-[10px] font-bold text-rose-700')
+
+
 def _render_case_monitor(user: Dict[str, Any], fir_id: str,
                          detail: Dict[str, Any], state: Dict[str, str]) -> None:
     """Authorized case monitor body, re-rendered whenever the investigating officer publishes an update."""
     case = detail['case']
+    record = detail.get('record') or {}
 
     with ui.column().classes('w-full gap-0'):
         with ui.card().classes('w-full p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'):
@@ -1475,6 +2442,9 @@ def _render_case_monitor(user: Dict[str, Any], fir_id: str,
                         with ui.column().classes('gap-0.5'):
                             ui.label(label).classes('text-[10px] font-black text-slate-500 uppercase tracking-wider')
                             ui.label(str(value)).classes('text-xs font-bold text-slate-900')
+
+        # ── Complete case record: origin, identity, registration ─
+        _render_case_origin(record)
 
         # ── Instruction to the investigating officer ─────────
         with ui.card().classes('w-full mt-6 p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'):
@@ -1544,6 +2514,9 @@ def _render_case_monitor(user: Dict[str, Any], fir_id: str,
                                         'text-[9px] text-slate-500')
                             ui.label(_mon_fmt(row.get('timestamp'))).classes(
                                 'text-[9px] text-slate-400 font-mono shrink-0')
+
+        # ── Modifications, audit trail and version hashes ────
+        _render_modifications_and_hashes(record)
 
         # ── Internal notes and evidence ──────────────────────
         with ui.card().classes('w-full mt-6 p-6 bg-white border border-slate-200 rounded-3xl shadow-sm'):
@@ -1641,6 +2614,9 @@ def _render_case_monitor(user: Dict[str, Any], fir_id: str,
 
                             ui.button('View', icon='visibility', on_click=open_citizen_file).props(
                                 'outline dense size=sm no-caps').classes('text-emerald-800 font-bold border-emerald-300')
+
+        # ── Generated FIR documents, current and past versions ─
+        _render_case_documents(user, record)
 
         # ── Reassignment trail and milestone credits ─────────
         with ui.row().classes('w-full gap-4 flex-wrap items-start mt-6'):
@@ -1829,3 +2805,169 @@ def admin_profile_page() -> None:
             ui.button('Save Profile Changes', icon='save', on_click=save_profile).props(
                 'unelevated'
             ).classes('bg-indigo-800 hover:bg-indigo-900 text-white font-bold rounded-xl px-5 py-2.5 text-xs mt-2')
+
+
+# ==========================================
+# 8. AUTHORIZED OFFICER NOTIFICATION CENTRE
+# ==========================================
+
+ADMIN_EVENT_LABELS = {
+    'CITIZEN_REGISTRATION': ('Citizen registrations', 'how_to_reg'),
+    'CITIZEN_VERIFICATION': ('Registration decisions', 'verified_user'),
+    'CITIZEN_CREDENTIALS': ('Citizen accounts', 'badge'),
+    'COMPLAINT_SUBMISSION': ('Complaint submissions', 'inbox'),
+    'COMPLAINT_SUBMITTED': ('Complaint submissions', 'inbox'),
+    'FIR_SUBMISSION': ('FIR submissions', 'description'),
+    'NEW_FIR': ('FIR submissions', 'description'),
+    'FIR_REGISTERED': ('FIR registrations', 'gavel'),
+    'FIR_VERIFIED': ('FIR verification', 'fact_check'),
+    'FIR_REJECTED': ('FIR returned for correction', 'report_gmailerrorred'),
+    'FIR_UPDATE': ('FIR modifications', 'edit_document'),
+    'FIR_DOCUMENT': ('FIR documents', 'picture_as_pdf'),
+    'OFFICER_ASSIGNMENT': ('Officer assignments', 'assignment_ind'),
+    'OFFICER_ASSIGNED': ('Officer assignments', 'assignment_ind'),
+    'INVESTIGATION_UPDATE': ('Investigation updates', 'manage_search'),
+    'CASE_STAGE_UPDATE': ('Case tracking', 'track_changes'),
+    'AUDIT_ALERT': ('Audit records', 'policy'),
+    'SECURITY_ALERT': ('Integrity alerts', 'gpp_bad'),
+    'ADMIN_INSTRUCTION': ('Instructions issued', 'campaign'),
+    'OFFICER_CREDIT': ('Officer credits', 'military_tech'),
+    'CHAT_MESSAGE': ('Citizen chat', 'chat'),
+}
+
+
+@ui.page('/admin/notifications')
+def admin_notifications_page() -> None:
+    """Authorized Officer inbox: every registered database event addressed to this account."""
+    user = require_admin_user()
+    if not user:
+        return
+
+    with portal_page(
+        'admin', '/admin/notifications', 'Notification Centre',
+        'Registrations, complaints, FIR actions, assignments, investigation updates and audit records.',
+    ):
+        filter_value = {'category': 'ALL'}
+
+        @ui.refreshable
+        def inbox() -> None:
+            notifications = get_user_notifications(user['id'], limit=200)
+            unread = get_unread_count(user['id'])
+
+            categories = []
+            for notification in notifications:
+                label = ADMIN_EVENT_LABELS.get(notification.get('type'), (None, None))[0]
+                if label and label not in categories:
+                    categories.append(label)
+            if filter_value['category'] != 'ALL':
+                notifications = [
+                    n for n in notifications
+                    if ADMIN_EVENT_LABELS.get(n.get('type'), (None, None))[0] == filter_value['category']
+                ]
+
+            with ui.card().classes(
+                'w-full p-5 rounded-2xl bg-white border border-slate-200 shadow-sm'
+            ):
+                with ui.row().classes(
+                    'w-full items-center justify-between flex-wrap gap-3 pb-3 border-b border-slate-200'
+                ):
+                    with ui.row().classes('items-center gap-3'):
+                        ui.icon('notifications_active', size='md').classes('text-indigo-800')
+                        ui.label('Authorized Officer Alerts').classes(
+                            'text-xl font-black text-slate-900 fantasy-title')
+                        if unread:
+                            ui.badge(f'{unread} Unread').classes(
+                                'bg-amber-500 text-slate-950 font-bold text-xs px-2.5 py-0.5 rounded-full')
+                    with ui.row().classes('items-center gap-2 flex-wrap'):
+                        ui.select(
+                            ['ALL'] + categories,
+                            value=filter_value['category'],
+                            on_change=lambda e: (filter_value.update({'category': e.value or 'ALL'}),
+                                                 inbox.refresh()),
+                        ).props('outlined dense options-dense label=Category').classes('w-52')
+                        if notifications:
+                            def read_all() -> None:
+                                mark_all_read(user['id'])
+                                ui.notify('All notifications marked as read.', type='positive')
+                                inbox.refresh()
+
+                            ui.button('Mark All Read', icon='done_all', on_click=read_all).props(
+                                'outline size=sm'
+                            ).classes('text-indigo-800 font-bold rounded-xl')
+
+                ui.label(
+                    f'{len(notifications)} event(s) stored for this account. '
+                    'Alerts are written to the notifications table by the same service the '
+                    'header bell uses, so both views always agree.'
+                ).classes('text-[11px] text-slate-500 mt-2')
+
+            if not notifications:
+                with ui.column().classes('w-full items-center py-16 gap-3 text-center'):
+                    ui.icon('notifications_none', size='xl').classes('text-slate-300')
+                    ui.label('No notifications received yet.').classes(
+                        'text-base font-bold text-slate-700')
+                    ui.label(
+                        'Registrations, complaint submissions, FIR actions and audit records '
+                        'will appear here the moment they are stored.'
+                    ).classes('text-xs text-slate-500 max-w-md')
+                return
+
+            with ui.column().classes('w-full gap-3 mt-4'):
+                for notification in notifications:
+                    is_read = notification.get('is_read', 0) == 1
+                    label, icon = ADMIN_EVENT_LABELS.get(
+                        notification.get('type'), ('System update', 'notifications'))
+                    severity = str(notification.get('severity') or 'INFO').upper()
+                    accent = {
+                        'SUCCESS': 'border-l-emerald-500',
+                        'WARNING': 'border-l-amber-500',
+                        'ALERT': 'border-l-red-500',
+                        'ERROR': 'border-l-red-500',
+                    }.get(severity, 'border-l-indigo-500')
+                    with ui.card().classes(
+                        f'w-full p-4 rounded-2xl border border-slate-200 border-l-4 {accent} '
+                        f'shadow-xs {"bg-white" if not is_read else "bg-slate-50 opacity-80"}'
+                    ):
+                        with ui.row().classes('w-full items-start gap-3'):
+                            ui.icon(icon if not is_read else 'mail', size='sm').classes(
+                                'text-indigo-800 mt-1')
+                            with ui.column().classes('gap-1 flex-1'):
+                                with ui.row().classes(
+                                    'w-full items-center justify-between flex-wrap gap-2'
+                                ):
+                                    ui.label(notification.get('title') or 'Notification').classes(
+                                        'text-sm font-black text-slate-900')
+                                    ui.label(_mon_fmt(notification.get('created_at'))).classes(
+                                        'text-[10px] text-slate-400 font-mono')
+                                ui.label(notification.get('message') or '').classes(
+                                    'text-xs text-slate-700 whitespace-pre-line leading-relaxed')
+                                with ui.row().classes('items-center gap-2 flex-wrap mt-1'):
+                                    ui.badge(label).classes(
+                                        'bg-indigo-50 text-indigo-800 border border-indigo-200 '
+                                        'font-bold text-[10px] px-2')
+                                    fir_number = notification.get('fir_number')
+                                    fir_target = notification.get('case_fir_id') or notification.get('fir_id')
+                                    if fir_number and fir_target:
+                                        ui.button(
+                                            f'Open FIR {fir_number}', icon='folder_special',
+                                            on_click=lambda t=fir_target: ui.navigate.to(
+                                                f'/admin/investigations/{t}'),
+                                        ).props('flat dense no-caps size=xs').classes(
+                                            'text-blue-800 font-bold text-[10px]')
+                                    elif notification.get('complaint_reference'):
+                                        ui.label(
+                                            f"Complaint {notification.get('complaint_reference')}"
+                                        ).classes('text-[10px] font-bold text-slate-500 font-mono')
+                                    if not is_read:
+                                        def mark_one(nid=notification['id']) -> None:
+                                            mark_notification_read(nid, user['id'])
+                                            inbox.refresh()
+
+                                        ui.button('Mark as Read', icon='done', on_click=mark_one).props(
+                                            'flat dense no-caps size=xs'
+                                        ).classes('text-indigo-800 font-bold text-[10px]')
+
+        inbox()
+        _mon_listen(inbox)
+        ui.timer(25.0, inbox.refresh)
+
