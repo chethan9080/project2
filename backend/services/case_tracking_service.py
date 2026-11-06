@@ -132,6 +132,9 @@ def init_case_tracking_table():
         # Citizen-visible update text; ``remarks`` stays internal to police and administrators.
         cursor.execute("ALTER TABLE case_tracking ADD COLUMN public_note TEXT")
     
+    # security_alerts table is created by init_database() in db.py with the full schema.
+    # Redeclare here so init_case_tracking_table() is self-contained when called before
+    # init_database() (e.g. at module import time during tests).
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS security_alerts (
             id TEXT PRIMARY KEY,
@@ -153,7 +156,6 @@ def init_case_tracking_table():
             FOREIGN KEY (fir_id) REFERENCES firs(id)
         )
     """)
-    
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_security_alerts_fir ON security_alerts(fir_id, status)
     """)
@@ -572,8 +574,15 @@ def update_case_stage(
     # Notify Citizen
     stage_label = STAGE_LABELS.get(canonical_stage, canonical_stage)
     citizen_message = f"Your FIR {fir['fir_number']} has advanced to Stage: {stage_label}."
-    if remarks:
-        citizen_message += f"\n\nOfficer Progress Note: {remarks}"
+    # Officer remarks are internal investigation notes; only the curated stage
+    # wording is public-safe enough to reach a citizen.
+    try:
+        from backend.services.investigation_service import PUBLIC_STAGE_TEXT
+    except Exception:
+        PUBLIC_STAGE_TEXT = {}
+    public_line = PUBLIC_STAGE_TEXT.get(canonical_stage)
+    if public_line:
+        citizen_message += f"\n\n{public_line}"
         
     create_notification(
         user_id=fir['citizen_id'],
@@ -792,8 +801,11 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
         # Check if stage has history entry
         stage_hist = history_by_stage.get(stage_key)
         
-        # Check alerts related to this stage
-        stage_alerts = [a for a in all_alerts if normalize_stage(a.get('stage')) == stage_key]
+        # Check alerts related to this stage. Security alerts carry internal reasons
+        # and account identities, so they are never surfaced in the citizen view.
+        stage_alerts = [] if is_public_view else [
+            a for a in all_alerts if normalize_stage(a.get('stage')) == stage_key
+        ]
         has_critical_alert = any(a.get('severity') == 'CRITICAL' and a.get('status') == 'PENDING_INVESTIGATION' for a in stage_alerts)
         has_warning_alert = any(a.get('severity') == 'WARNING' and a.get('status') == 'PENDING_INVESTIGATION' for a in stage_alerts)
         
@@ -863,11 +875,12 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
         else:
             # Investigation stages: completed only when actually recorded, skipped otherwise.
             def _officer_line(hist):
-                return " ".join(part for part in (
-                    hist.get('updated_by_officer_name'),
-                    f"({hist.get('updated_by_officer_badge')})"
-                    if hist.get('updated_by_officer_badge') not in (None, '', 'N/A') else None,
-                ) if part)
+                parts = [hist.get('updated_by_officer_name')]
+                badge = hist.get('updated_by_officer_badge')
+                # Internal badge numbers stay out of the citizen-facing timeline.
+                if not is_public_view and badge not in (None, '', 'N/A'):
+                    parts.append(f"({badge})")
+                return " ".join(part for part in parts if part)
 
             is_current = idx == cur_idx and not is_closed
             if stage_hist and (idx < cur_idx or is_closed or (is_current and current_action == 'COMPLETED')
@@ -913,7 +926,7 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
             'alerts': stage_alerts
         })
         
-    return {
+    tracking = {
         'fir_id': fir_id,
         'fir_number': fir.get('fir_number'),
         'reference_number': fir.get('reference_number'),
@@ -940,6 +953,21 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
             'station': fir.get('police_station')
         }
     }
+
+    # Cryptographic integrity and security-alert detail is technical audit data. Citizens
+    # get a plain progress colour only; every non-Administrator role loses the hash block.
+    if is_public_view:
+        tracking['security_status'] = {
+            'status': sec_status.get('status'),
+            'color': sec_status.get('color'),
+            'summary': '',
+            'badge_text': '',
+            'alerts': [],
+        }
+    elif role != 'ADMIN':
+        tracking['security_status'] = {**sec_status, 'integrity': {}}
+
+    return tracking
 
 
 def get_all_firs_for_tracking(

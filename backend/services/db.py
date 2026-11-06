@@ -559,6 +559,87 @@ def init_database() -> None:
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_fir_docs ON fir_documents(fir_id, is_current);")
 
+    # 14. Case Tracking Table (10-Stage FIR Progression History)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS case_tracking (
+        id TEXT PRIMARY KEY,
+        track_id TEXT UNIQUE NOT NULL,
+        fir_id TEXT NOT NULL,
+        previous_stage TEXT,
+        new_stage TEXT NOT NULL,
+        action TEXT,
+        public_note TEXT,
+        updated_by_officer_id TEXT NOT NULL,
+        updated_by_officer_name TEXT NOT NULL,
+        updated_by_officer_badge TEXT NOT NULL,
+        remarks TEXT,
+        timestamp TEXT NOT NULL,
+        FOREIGN KEY (fir_id) REFERENCES firs(id),
+        FOREIGN KEY (updated_by_officer_id) REFERENCES users(id)
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_case_tracking_fir ON case_tracking(fir_id, timestamp);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_case_tracking_track_id ON case_tracking(track_id);")
+
+    # 15. Security Alerts Table (full schema used by case_tracking_service)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS security_alerts (
+        id TEXT PRIMARY KEY,
+        alert_id TEXT UNIQUE NOT NULL,
+        fir_id TEXT NOT NULL,
+        fir_number TEXT NOT NULL,
+        stage TEXT,
+        alert_type TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        responsible_account TEXT,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        resolved_by_id TEXT,
+        resolved_by_name TEXT,
+        resolved_by_badge TEXT,
+        resolution_notes TEXT,
+        FOREIGN KEY (fir_id) REFERENCES firs(id)
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_security_alerts_fir ON security_alerts(fir_id, status);")
+    # Migration: add columns if the old minimal schema was already created
+    add_col_if_missing("security_alerts", "stage TEXT")
+    add_col_if_missing("security_alerts", "reason TEXT NOT NULL DEFAULT ''")
+    add_col_if_missing("security_alerts", "responsible_account TEXT")
+    add_col_if_missing("security_alerts", "status TEXT NOT NULL DEFAULT 'PENDING_INVESTIGATION'")
+    add_col_if_missing("security_alerts", "created_at TEXT NOT NULL DEFAULT ''")
+    add_col_if_missing("security_alerts", "resolved_at TEXT")
+    add_col_if_missing("security_alerts", "resolved_by_id TEXT")
+    add_col_if_missing("security_alerts", "resolved_by_name TEXT")
+    add_col_if_missing("security_alerts", "resolved_by_badge TEXT")
+    add_col_if_missing("security_alerts", "resolution_notes TEXT")
+
+    # 16. Investigation Entries (Case Notes & Evidence)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS investigation_entries (
+        id TEXT PRIMARY KEY,
+        fir_id TEXT NOT NULL,
+        officer_id TEXT NOT NULL,
+        officer_name TEXT NOT NULL,
+        entry_type TEXT NOT NULL CHECK(entry_type IN ('NOTE', 'EVIDENCE')),
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        collected_at TEXT,
+        evidence_status TEXT,
+        file_name TEXT,
+        stored_name TEXT,
+        content_type TEXT,
+        file_size INTEGER,
+        sha256 TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (fir_id) REFERENCES firs(id),
+        FOREIGN KEY (officer_id) REFERENCES users(id)
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_investigation_fir ON investigation_entries(fir_id, created_at);")
+
     # Migration: ensure chat_messages has complaint_id column
     add_col_if_missing("chat_messages", "complaint_id TEXT")
 
@@ -572,6 +653,14 @@ def init_database() -> None:
     add_col_if_missing("complaints", "verified_by_name TEXT")
     add_col_if_missing("complaints", "verified_at TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_complaints_verification ON complaints(verification_status);")
+
+    # Migration: officer review of the FIR details before registration; the registered
+    # FIR inherits these corrected values instead of the registration defaults.
+    add_col_if_missing("complaints", "accused_details TEXT")
+    add_col_if_missing("complaints", "witness_details TEXT")
+    add_col_if_missing("complaints", "fir_edited_by TEXT")
+    add_col_if_missing("complaints", "fir_edited_by_name TEXT")
+    add_col_if_missing("complaints", "fir_edited_at TEXT")
 
     conn.commit()
     conn.close()
