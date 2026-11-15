@@ -28,3 +28,22 @@ def set_test_mode(enabled: bool) -> None:
 def get_app_environment() -> str:
     """Return current environment descriptor ('production' or 'development')."""
     return "production" if not _IS_TEST_MODE else "development"
+
+
+def get_secure_uploads_root() -> str:
+    """Return the absolute path for persistent secure uploads.
+    Respects SECURE_UPLOADS_DIR, DATA_DIR, or the parent directory of FIR_DB_PATH if configured.
+    Falls back to project's data/secure_uploads.
+    """
+    if os.environ.get('SECURE_UPLOADS_DIR'):
+        path = os.path.abspath(os.environ['SECURE_UPLOADS_DIR'])
+    elif os.environ.get('DATA_DIR'):
+        path = os.path.abspath(os.path.join(os.environ['DATA_DIR'], 'secure_uploads'))
+    elif os.environ.get('FIR_DB_PATH'):
+        db_dir = os.path.dirname(os.path.abspath(os.environ['FIR_DB_PATH']))
+        path = os.path.abspath(os.path.join(db_dir, 'secure_uploads'))
+    else:
+        path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'secure_uploads'))
+    os.makedirs(path, exist_ok=True)
+    return path
+

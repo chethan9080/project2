@@ -3,6 +3,7 @@ Unified Navigation Headers for Citizen, Police Officer, and Administrator Portal
 Includes centralized 3-language switcher (English, ಕನ್ನಡ, हिन्दी).
 """
 
+import asyncio
 from typing import List, Optional
 
 from nicegui import ui, background_tasks, context
@@ -41,6 +42,21 @@ def render_language_switcher() -> None:
 def scroll_to_section(index: int) -> None:
     """Smooth-scroll to the nth landing-page section, clearing the fixed header."""
     ui.run_javascript(f'window.scrollToSection && window.scrollToSection({int(index)})')
+
+
+def go_back() -> None:
+    """Return to the previous page, falling back to the public landing page."""
+    ui.run_javascript(
+        "if (window.history.length > 1) { window.history.back(); } "
+        "else { window.location.href = '/'; }"
+    )
+
+
+def render_back_button() -> None:
+    """Back button shared by every header, so no page is a dead end."""
+    ui.button(icon='arrow_back', on_click=go_back).props(
+        'flat round dense color=white aria-label=Back'
+    ).classes('shrink-0 text-white').tooltip('Back')
 
 
 def _toggle_citizen_drawer(client_id: str) -> None:
@@ -91,6 +107,9 @@ def create_public_header(
         with ui.row().classes(
             'w-full max-w-7xl mx-auto items-center justify-between gap-x-3 gap-y-2'
         ):
+            # Back navigation, available on every public page.
+            render_back_button()
+
             # Logo and title
             with ui.row().classes(
                 'nav-brand min-w-0 flex-1 flex-nowrap items-center gap-2.5 cursor-pointer'
@@ -178,20 +197,24 @@ def create_topbar(title: str = 'Online FIR Portal') -> None:
         'border-color: rgba(217, 119, 6, 0.3);'
     ):
         with ui.row().classes('w-full max-w-7xl mx-auto items-center justify-between flex-wrap gap-4'):
-            # The citizen drawer collapses on phones, so give it a way back open.
-            if user_role == 'CITIZEN':
-                client_id = context.client.id
-                ui.button(icon='menu', on_click=lambda: _toggle_citizen_drawer(client_id)).props(
-                    'flat round dense color=white'
-                ).classes('shrink-0 -ml-3 text-white')
+            with ui.row().classes('items-center gap-3 min-w-0'):
+                # Back navigation, available on every portal page.
+                render_back_button()
 
-            # Brand
-            with ui.row().classes('items-center gap-3 cursor-pointer').on('click', lambda: ui.navigate.to('/')):
-                ui.icon('security', size='md').classes('text-amber-400')
-                with ui.column().classes('gap-0'):
-                    ui.label(t(title)).classes('text-lg font-bold text-white fantasy-title')
-                    platform_tagline = 'Secure Government FIR Portal' if user_role == 'CITIZEN' else 'Tamper-Evident Blockchain Proof Platform'
-                    ui.label(t(platform_tagline)).classes('text-[10px] text-amber-200 tracking-wider')
+                # The citizen drawer collapses on phones, so give it a way back open.
+                if user_role == 'CITIZEN':
+                    client_id = context.client.id
+                    ui.button(icon='menu', on_click=lambda: _toggle_citizen_drawer(client_id)).props(
+                        'flat round dense color=white'
+                    ).classes('shrink-0 -ml-3 text-white')
+
+                # Brand
+                with ui.row().classes('items-center gap-3 cursor-pointer').on('click', lambda: ui.navigate.to('/')):
+                    ui.icon('security', size='md').classes('text-amber-400')
+                    with ui.column().classes('gap-0'):
+                        ui.label(t(title)).classes('text-lg font-bold text-white fantasy-title')
+                        platform_tagline = 'Secure Government FIR Portal' if user_role == 'CITIZEN' else 'Tamper-Evident Blockchain Proof Platform'
+                        ui.label(t(platform_tagline)).classes('text-[10px] text-amber-200 tracking-wider')
 
             # User Profile, Language Switcher & Action Pills
             with ui.row().classes('items-center gap-3 flex-wrap'):
@@ -227,25 +250,30 @@ def create_topbar(title: str = 'Online FIR Portal') -> None:
 
                         async def watch_notifications() -> None:
                             while True:
-                                event = await event_queue.get()
-                                if event.get('type') not in ('NOTIFICATION_CREATED', 'NOTIFICATION_UPDATED'):
-                                    continue
-                                if event.get('user_id') != user.get('id'):
-                                    continue
-                                with client:
-                                    unread_badge.refresh()
+                                try:
+                                    event = await event_queue.get()
+                                    if event.get('type') not in ('NOTIFICATION_CREATED', 'NOTIFICATION_UPDATED', 'CHAT_MESSAGE', 'CHAT_READ'):
+                                        continue
+                                    target_user = user.get('id')
+                                    if event.get('user_id') != target_user and event.get('receiver_id') != target_user:
+                                        continue
+                                    with client:
+                                        unread_badge.refresh()
+                                except asyncio.CancelledError:
+                                    break
+                                except Exception:
+                                    await asyncio.sleep(0.5)
 
                         event_listener = background_tasks.create(
                             watch_notifications(), name='topbar-notification-badge'
                         )
 
                         def resync_badge() -> None:
-                            # Push events are dropped while a tab is reconnecting, so the badge
-                            # also re-reads the database periodically and cannot stay stale.
+                            # Periodic safety re-read from central database every 3 seconds
                             with client:
                                 unread_badge.refresh()
 
-                        resync_timer = ui.timer(30.0, resync_badge)
+                        resync_timer = ui.timer(3.0, resync_badge)
 
                         def stop_badge_listener() -> None:
                             unsubscribe(event_queue)

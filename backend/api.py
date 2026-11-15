@@ -659,6 +659,7 @@ def api_audit_logs(
 class ReassignOfficerPayload(BaseModel):
     new_officer_id: str
     reason: str
+    remarks: str = ''
 
 
 @api_router.post("/authorized/firs/{fir_id}/reassign-officer")
@@ -679,7 +680,8 @@ def api_reassign_officer(
             fir_id=fir_id,
             new_officer_id=payload.new_officer_id,
             reason=payload.reason,
-            user=user
+            user=user,
+            remarks=payload.remarks
         )
     except PermissionError as pe:
         raise HTTPException(status_code=403, detail=str(pe))

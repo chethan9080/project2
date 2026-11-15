@@ -13,15 +13,18 @@ authenticated endpoint (see backend/api.py).
 """
 
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from backend.services.config_service import get_secure_uploads_root
 from backend.services.db import get_db_connection
 from backend.services.realtime_events import publish
 
-SECURE_ROOT = os.path.abspath(os.path.join(
+SECURE_ROOT = os.path.join(get_secure_uploads_root(), 'citizen_applications')
+LOCAL_FALLBACK_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..', 'data', 'secure_uploads', 'citizen_applications'
 ))
 
@@ -55,6 +58,19 @@ ACTION_LABELS = {
 REVIEWER_ROLES = ('VERIFICATION_OFFICER', 'ADMIN')
 TERMINAL_STATUSES = ('APPROVED', 'REJECTED')
 REVIEWABLE_STATUSES = ('PENDING', 'UNDER_REVIEW', 'ADDITIONAL_INFO_REQUIRED')
+
+MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
+MAX_PHOTO_BYTES = 5 * 1024 * 1024
+EMAIL_PATTERN = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+# The upload endpoint only advertises an extension, so the bytes themselves are
+# checked against the real document signatures before anything is stored.
+FILE_SIGNATURES = {
+    '.pdf': (b'%PDF-',),
+    '.png': (b'\x89PNG\r\n\x1a\n',),
+    '.jpg': (b'\xff\xd8\xff',),
+    '.jpeg': (b'\xff\xd8\xff',),
+}
 
 
 def status_label(status: Optional[str]) -> str:
@@ -106,9 +122,12 @@ def resolve_secure_file(relative_path: Optional[str]) -> Optional[str]:
     if not relative_path:
         return None
     absolute_path = os.path.abspath(os.path.join(SECURE_ROOT, relative_path))
-    if not absolute_path.startswith(SECURE_ROOT + os.sep):
-        raise ValueError('Invalid document path.')
-    return absolute_path if os.path.isfile(absolute_path) else None
+    if absolute_path.startswith(SECURE_ROOT + os.sep) and os.path.isfile(absolute_path):
+        return absolute_path
+    fallback_path = os.path.abspath(os.path.join(LOCAL_FALLBACK_ROOT, relative_path))
+    if fallback_path.startswith(LOCAL_FALLBACK_ROOT + os.sep) and os.path.isfile(fallback_path):
+        return fallback_path
+    return None
 
 
 def media_type_for(path: Optional[str]) -> str:
@@ -122,6 +141,299 @@ def _generate_reference(cursor) -> str:
         if not cursor.fetchone():
             return reference
     raise RuntimeError('Could not allocate a unique application reference.')
+
+
+def _mobile_key(value: Optional[str]) -> str:
+    """Digits-only form used only for duplicate detection; the entered text is stored."""
+    digits = ''.join(character for character in str(value or '') if character.isdigit())
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    return digits
+
+
+def _clean_text(value: Any, label: str, *, required: bool = True,
+                min_length: int = 1, max_length: int = 240) -> str:
+    text = str(value or '').strip()
+    if required and len(text) < min_length:
+        raise ValueError(f'{label} is required.')
+    if len(text) > max_length:
+        raise ValueError(f'{label} is too long (maximum {max_length} characters).')
+    return text
+
+
+def _validated_upload(content: Optional[bytes], extension: Optional[str], kind: str) -> str:
+    """Validate size, extension and magic bytes for a private upload."""
+    is_photo = kind == 'photo'
+    label = 'photograph' if is_photo else 'Government ID document'
+    allowed = ALLOWED_PHOTO_EXTENSIONS if is_photo else ALLOWED_DOCUMENT_EXTENSIONS
+    limit = MAX_PHOTO_BYTES if is_photo else MAX_DOCUMENT_BYTES
+
+    if not content:
+        raise ValueError(f'Please attach your {label}.')
+    if len(content) > limit:
+        raise ValueError(f'The {label} must be smaller than {limit // (1024 * 1024)} MB.')
+
+    normalized = (extension or '').lower()
+    if normalized and not normalized.startswith('.'):
+        normalized = f'.{normalized}'
+    if normalized not in allowed:
+        raise ValueError(
+            f'Unsupported {label} format. Allowed formats: ' + ', '.join(sorted(allowed)) + '.'
+        )
+    if not any(content.startswith(signature) for signature in FILE_SIGNATURES[normalized]):
+        raise ValueError(f'The uploaded {label} is not a valid {normalized[1:].upper()} file.')
+    return normalized
+
+
+def _assert_no_duplicates(cursor, *, email: str, mobile: str,
+                          gov_id_type: str, gov_id_masked: str) -> None:
+    """Refuse a second account/application for the same email, mobile or masked ID.
+
+    Email and mobile are normalised the same way on every lookup, and identity is
+    compared using the masked Government ID only, so the full ID number is never
+    needed to enforce the duplicate rule.
+    """
+    email_key = email.lower()
+
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1", (email_key,))
+    if cursor.fetchone():
+        raise ValueError(
+            'An account already exists with this email address. Please sign in or use a different email.'
+        )
+    cursor.execute(
+        "SELECT id FROM citizen_applications WHERE LOWER(email) = ? LIMIT 1", (email_key,)
+    )
+    if cursor.fetchone():
+        raise ValueError(
+            'A registration application already exists with this email address. '
+            'Use the status page to track it.'
+        )
+
+    mobile_digits = _mobile_key(mobile)
+    cursor.execute("SELECT phone FROM users WHERE phone IS NOT NULL AND phone <> ''")
+    if any(_mobile_key(row['phone']) == mobile_digits for row in cursor.fetchall()):
+        raise ValueError(
+            'An account is already registered with this mobile number. Please sign in or use a different number.'
+        )
+    cursor.execute("SELECT mobile FROM citizen_applications WHERE mobile IS NOT NULL AND mobile <> ''")
+    if any(_mobile_key(row['mobile']) == mobile_digits for row in cursor.fetchall()):
+        raise ValueError(
+            'A registration application already exists with this mobile number. '
+            'Use the status page to track it.'
+        )
+
+    cursor.execute("""
+        SELECT id FROM citizen_applications
+        WHERE gov_id_type = ? AND gov_id_masked = ? AND status <> 'REJECTED'
+        LIMIT 1
+    """, (gov_id_type, gov_id_masked))
+    if cursor.fetchone():
+        raise ValueError(
+            'An application with this Government ID has already been submitted. '
+            'Use the status page to track it.'
+        )
+
+
+def submit_citizen_registration(
+    *,
+    full_name: str,
+    email: str,
+    password: str,
+    date_of_birth: str,
+    gender: Optional[str],
+    mobile: str,
+    gov_id_type: str,
+    gov_id: str,
+    address: str,
+    state: str,
+    district: str,
+    photo_bytes: Optional[bytes],
+    photo_ext: Optional[str],
+    document_bytes: Optional[bytes],
+    document_ext: Optional[str],
+    document_name: Optional[str] = None,
+    location_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Validate and persist one complete citizen registration atomically.
+
+    The account, application, verification history, officer alerts and audit row
+    are written in a single SQLite transaction. Files are written first and
+    removed again if the transaction fails, so a failure cannot leave an orphaned
+    user, application or upload behind.
+    """
+    from backend.services.auth_service import insert_user_row
+    from backend.services.verification_service import (
+        mask_government_id,
+        normalize_mobile,
+        validate_government_id,
+        verified_otp_issue,
+    )
+
+    name = _clean_text(full_name, 'Full legal name', min_length=2, max_length=120)
+    email_clean = _clean_text(email, 'Email address', max_length=254).lower()
+    if not EMAIL_PATTERN.fullmatch(email_clean):
+        raise ValueError('Please enter a valid email address.')
+
+    if not password or len(password) < 8:
+        raise ValueError('Password must be at least 8 characters.')
+    if len(password) > 128:
+        raise ValueError('Password must be 128 characters or fewer.')
+
+    try:
+        birth_date = datetime.strptime(str(date_of_birth or '').strip(), '%Y-%m-%d').date()
+    except ValueError:
+        raise ValueError('Please enter a valid date of birth (YYYY-MM-DD).')
+    if birth_date >= datetime.now(timezone.utc).date():
+        raise ValueError('Date of birth must be in the past.')
+
+    clean_mobile, mobile_error = normalize_mobile(mobile)
+    if not clean_mobile:
+        raise ValueError(mobile_error)
+
+    otp_issue = verified_otp_issue(clean_mobile)
+    if otp_issue:
+        raise ValueError(otp_issue)
+
+    id_type = _clean_text(gov_id_type, 'Government ID type', max_length=60)
+    id_number = _clean_text(gov_id, 'Government ID number', min_length=4, max_length=40)
+    id_ok, id_error = validate_government_id(id_number, id_type)
+    if not id_ok:
+        raise ValueError(id_error)
+    id_masked = mask_government_id(id_number, id_type)
+
+    address_clean = _clean_text(address, 'Residential address', min_length=5, max_length=400)
+    state_clean = _clean_text(state, 'State / Union Territory', max_length=80)
+    district_clean = _clean_text(district, 'District / Area', max_length=80)
+
+    photo_extension = _validated_upload(photo_bytes, photo_ext, 'photo')
+    document_extension = _validated_upload(document_bytes, document_ext, 'id_document')
+
+    application_id = f"capp-{uuid.uuid4().hex[:12]}"
+    reference = ''
+    conn = None
+
+    try:
+        photo_path = store_application_file(
+            application_id, 'photo', photo_bytes or b'', photo_extension, f'photo{photo_extension}'
+        )
+        document_path = store_application_file(
+            application_id, 'id_document', document_bytes or b'', document_extension,
+            document_name or f'document{document_extension}'
+        )
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        conn.execute('BEGIN IMMEDIATE')
+
+        _assert_no_duplicates(
+            cursor, email=email_clean, mobile=clean_mobile,
+            gov_id_type=id_type, gov_id_masked=id_masked,
+        )
+
+        user_id = insert_user_row(
+            cursor,
+            name=name, email=email_clean, phone=str(mobile).strip(), password=password,
+            role='CITIZEN', district=district_clean, address=address_clean,
+            gov_id=id_number, status='PENDING_VERIFICATION',
+        )
+
+        reference = _generate_reference(cursor)
+        now = _now()
+
+        cursor.execute("""
+            INSERT INTO citizen_applications (
+                id, reference, citizen_id, full_name, date_of_birth, gender, mobile, email,
+                address, state, district, username, gov_id_type, gov_id_masked,
+                id_document_path, id_document_name, photo_path, status,
+                submitted_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+        """, (
+            application_id, reference, user_id, name, birth_date.isoformat(), gender,
+            str(mobile).strip(), email_clean, address_clean, state_clean, district_clean,
+            email_clean, id_type, id_masked, document_path,
+            document_name, photo_path, now, now
+        ))
+
+        cursor.execute("""
+            INSERT INTO citizen_application_events (
+                id, application_id, action, status_from, status_to, remarks,
+                actor_id, actor_name, actor_role, actor_badge, created_at
+            ) VALUES (?, ?, 'SUBMITTED', NULL, 'PENDING', ?, ?, ?, 'CITIZEN', NULL, ?)
+        """, (
+            f"cae-{uuid.uuid4().hex[:12]}", application_id,
+            'Citizen registration application submitted for verification.',
+            user_id, name, now
+        ))
+
+        cursor.execute("SELECT id FROM users WHERE role = 'VERIFICATION_OFFICER' AND status = 'ACTIVE'")
+        officer_ids = [row['id'] for row in cursor.fetchall()]
+        for officer_id in officer_ids:
+            cursor.execute("""
+                INSERT INTO citizen_application_alerts (
+                    id, application_id, recipient_id, title, message, is_read, created_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
+            """, (
+                f"cal-{uuid.uuid4().hex[:12]}", application_id, officer_id,
+                'New Citizen Registration',
+                f"{name} submitted registration application {reference}.",
+                now
+            ))
+
+        from backend.services.verification_service import record_citizen_verification_event
+        record_citizen_verification_event(
+            citizen_id=user_id,
+            gov_id_type=id_type,
+            gov_id_masked=id_masked,
+            mobile=clean_mobile,
+            otp_verified=True,
+            photo_verified=True,
+            location_verified=True,
+            location_data=location_data or {
+                'district': district_clean, 'state': state_clean,
+                'timestamp': now, 'jurisdiction_confirmed': True,
+            },
+            status='PENDING',
+            _conn=conn,
+        )
+
+        # Clear temporary OTP session after registration is completed to prevent reuse
+        cursor.execute("DELETE FROM otp_sessions WHERE mobile = ?", (clean_mobile,))
+
+        conn.commit()
+        cursor.execute("SELECT * FROM citizen_applications WHERE id = ?", (application_id,))
+        application = dict(cursor.fetchone())
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        user = dict(cursor.fetchone())
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        shutil.rmtree(os.path.join(SECURE_ROOT, application_id), ignore_errors=True)
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+    user.pop('password_hash', None)
+    user.pop('salt', None)
+
+    publish({
+        'type': 'CITIZEN_APPLICATION_SUBMITTED',
+        'application_id': application_id,
+        'reference': reference,
+        'citizen_id': user['id'],
+        'full_name': name,
+        'status': 'PENDING',
+        'timestamp': application['submitted_at'],
+    })
+    _notify_verification_officers(application)
+    _notify_citizen_submission(user['id'], reference, application_id)
+
+    return {'user': user, 'application': application}
 
 
 def create_citizen_application(

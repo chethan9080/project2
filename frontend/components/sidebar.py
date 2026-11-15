@@ -78,8 +78,20 @@ def _is_authorized_officer(user: dict) -> bool:
     return any(r.lower() in rank for r in AUTHORIZED_OFFICER_RANKS)
 
 
-def create_sidebar(portal: str, active_path: str) -> None:
-    """Create navigation drawer matching selected role."""
+def _go_back() -> None:
+    """Return to the previous page, falling back to the landing page."""
+    ui.run_javascript(
+        "if (window.history.length > 1) { window.history.back(); } "
+        "else { window.location.href = '/'; }"
+    )
+
+
+def create_sidebar(portal: str, active_path: str, show_back: bool = False) -> None:
+    """Create navigation drawer matching selected role.
+
+    ``show_back`` adds a Back button for pages that render the sidebar without
+    the shared topbar (the chat pages), where navigation would otherwise dead-end.
+    """
     user = get_current_user() or {}
     links = list(PORTAL_LINKS.get(portal, PORTAL_LINKS['citizen']))
     portal_color = PORTAL_THEME_COLORS.get(portal, '#1B365D')
@@ -98,7 +110,12 @@ def create_sidebar(portal: str, active_path: str) -> None:
         # Header banner
         with ui.element('div').classes('relative px-6 pt-6 pb-4 border-b border-slate-200'):
             ui.element('div').classes('absolute left-0 top-0 bottom-0 w-1.5 rounded-r-full').style(f'background: {portal_color}')
-            ui.label(f'✦ {portal.title()} Portal').classes('text-xs font-bold tracking-widest text-slate-800 uppercase ml-3 fantasy-title')
+            with ui.row().classes('items-center gap-1 ml-3'):
+                if show_back:
+                    ui.button(icon='arrow_back', on_click=_go_back).props(
+                        'flat round dense color=primary aria-label=Back'
+                    ).classes('text-slate-700 -ml-2').tooltip('Back')
+                ui.label(f'✦ {portal.title()} Portal').classes('text-xs font-bold tracking-widest text-slate-800 uppercase fantasy-title')
 
         # Scrollable links
         with ui.scroll_area().classes('flex-1'):

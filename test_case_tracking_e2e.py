@@ -13,6 +13,9 @@ import tempfile as _tempfile
 import os as _os
 _os.environ.setdefault('FIR_DB_PATH', _os.path.join(_tempfile.gettempdir(), 'efir_scratch_test.db'))
 
+import pytest
+
+from backend.services.db import get_db_connection, init_database
 from backend.services.case_tracking_service import (
     get_case_stage_progress,
     update_case_stage,
@@ -23,6 +26,64 @@ from backend.services.case_tracking_service import (
 from backend.services.fir_service import get_firs, get_fir_by_id
 from backend.services.auth_service import get_all_officers, get_user_by_id
 from backend.services.notification_service import get_user_notifications
+
+SCRATCH_DB = _os.path.join(_tempfile.gettempdir(), 'efir_scratch_test.db')
+
+
+def _activate_scratch_db() -> None:
+    """Pin the throwaway DB and create its schema plus a tiny FIR.
+
+    The pytest suite re-points FIR_DB_PATH while collecting other test modules,
+    so the path is set here again before every test instead of at import time.
+    """
+    _os.environ['FIR_DB_PATH'] = SCRATCH_DB
+    init_database()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now = '2026-01-01T10:00:00+00:00'
+    cursor.execute("SELECT COUNT(*) AS n FROM firs")
+    if cursor.fetchone()['n']:
+        conn.close()
+        return
+    cursor.execute("""
+        INSERT INTO users (id, name, email, phone, password_hash, salt, role, status,
+                           badge_number, station, rank, created_at, updated_at, username)
+        VALUES ('usr-scratch-citizen', 'Scratch Citizen', 'scratch.citizen@example.test',
+                '9000000001', 'x', 'x', 'CITIZEN', 'ACTIVE', NULL, NULL, NULL, ?, ?, 'scratch-citizen')
+    """, (now, now))
+    cursor.execute("""
+        INSERT INTO users (id, name, email, phone, password_hash, salt, role, status,
+                           badge_number, station, rank, created_at, updated_at, username)
+        VALUES ('usr-scratch-officer', 'Scratch Officer', 'scratch.officer@example.test',
+                '9000000002', 'x', 'x', 'OFFICER', 'ACTIVE', 'SCRATCH-001',
+                'Scratch Station', 'Police Officer', ?, ?, 'scratch-officer')
+    """, (now, now))
+    cursor.execute("""
+        INSERT INTO firs (id, fir_number, reference_number, citizen_id, assigned_officer_id,
+                          police_station, status, incident_type, incident_date, incident_time,
+                          incident_location, description, evidence_files, current_version,
+                          current_hash, created_at, updated_at)
+        VALUES ('fir-scratch-0001', 'FIR-SCRATCH-01', 'REF-SCRATCH-01',
+                'usr-scratch-citizen', 'usr-scratch-officer', 'Scratch Station',
+                'UNDER_INVESTIGATION', 'Harassment', '2026-01-01', '10:00',
+                'Scratch Location', 'Scratch FIR for the tracking script.', '[]', 1,
+                'scratch-hash', ?, ?)
+    """, (now, now))
+    cursor.execute("""
+        INSERT INTO officer_assignments (id, fir_id, officer_id, assigned_by, assigned_at, status)
+        VALUES ('asg-scratch-01', 'fir-scratch-0001', 'usr-scratch-officer',
+                'usr-scratch-officer', ?, 'ACTIVE')
+    """, (now,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture(autouse=True)
+def _scratch_db_fixture():
+    _activate_scratch_db()
+
+
+_activate_scratch_db()
 
 
 def test_police_to_citizen_flow():

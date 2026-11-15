@@ -17,6 +17,7 @@ Everything shown is read from the database. Status changes are persisted,
 append-only audit events are recorded, the citizen is notified, and open
 dashboards receive the change over the in-process websocket event bus.
 """
+import asyncio
 import base64
 import json
 from datetime import datetime
@@ -196,15 +197,21 @@ def _listen(refreshable_fn, event_types, on_event=None) -> None:
 
     async def listener() -> None:
         while True:
-            event = await queue.get()
-            if event.get('type') not in event_types:
-                continue
-            if not client.has_socket_connection:
+            try:
+                event = await queue.get()
+                if event.get('type') not in event_types:
+                    continue
+                if not client.has_socket_connection:
+                    await asyncio.sleep(0.5)
+                    continue
+                with client:
+                    refreshable_fn.refresh()
+                    if on_event:
+                        on_event(event)
+            except asyncio.CancelledError:
                 break
-            with client:
-                refreshable_fn.refresh()
-                if on_event:
-                    on_event(event)
+            except Exception:
+                await asyncio.sleep(0.5)
 
     task = background_tasks.create(listener(), name='verification-live-listener')
 
@@ -427,7 +434,7 @@ def verification_dashboard() -> None:
                 type='info', position='top-right', timeout=3000,
             ),
         )
-        ui.timer(15.0, render_dashboard.refresh)
+        ui.timer(3.0, render_dashboard.refresh)
 
 
 # ==========================================
@@ -557,7 +564,7 @@ def verification_complaints_page() -> None:
                 type='info', position='top-right', timeout=5000,
             ) if event.get('reference') else None,
         )
-        ui.timer(15.0, render_queue.refresh)
+        ui.timer(3.0, render_queue.refresh)
 
 
 def _open_complaint_action_dialog(complaint: dict, user: dict, action: str) -> None:
@@ -1051,7 +1058,7 @@ def verification_firs_page() -> None:
             ('COMPLAINT_VERIFICATION_UPDATED', 'COMPLAINT_UPDATED', 'FIR_UPDATED',
              'FIR_DOCUMENT_GENERATED'),
         )
-        ui.timer(15.0, render_firs.refresh)
+        ui.timer(3.0, render_firs.refresh)
 
 
 def _document_index() -> list:
@@ -1436,7 +1443,7 @@ def fir_registration_page(complaint_id: str) -> None:
         # Another desk can verify, edit or register this complaint while the page is
         # open, so the record and the form follow the stored values without a reload.
         _listen(record_summary, ('COMPLAINT_UPDATED', 'COMPLAINT_VERIFICATION_UPDATED'))
-        ui.timer(15.0, record_summary.refresh)
+        ui.timer(3.0, record_summary.refresh)
 
 
 # ==========================================
@@ -2268,7 +2275,7 @@ def verification_history_page() -> None:
             render_history,
             ('COMPLAINT_VERIFICATION_UPDATED', 'CITIZEN_APPLICATION_UPDATED', 'FIR_UPDATED'),
         )
-        ui.timer(20.0, render_history.refresh)
+        ui.timer(3.0, render_history.refresh)
 
 
 # ==========================================
@@ -2389,7 +2396,7 @@ def verification_notifications_page() -> None:
                 if event.get('user_id') == user['id'] else None
             ),
         )
-        ui.timer(20.0, render_notifications.refresh)
+        ui.timer(3.0, render_notifications.refresh)
 
 
 # ==========================================

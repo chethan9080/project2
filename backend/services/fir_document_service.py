@@ -37,7 +37,11 @@ from reportlab.platypus import (
 from backend.services.db import get_db_connection
 from backend.services.realtime_events import publish
 
-SECURE_ROOT = os.path.abspath(os.path.join(
+from backend.services.config_service import get_secure_uploads_root
+from backend.services.file_store_service import write_file_with_blob, read_file_with_fallback
+
+SECURE_ROOT = os.path.join(get_secure_uploads_root(), 'fir_documents')
+LOCAL_FALLBACK_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..', 'data', 'secure_uploads', 'fir_documents'
 ))
 DOCUMENT_TYPE = 'FIR_PDF'
@@ -79,9 +83,23 @@ def resolve_document_file(relative_path: Optional[str]) -> Optional[str]:
     if not relative_path:
         return None
     absolute = os.path.abspath(os.path.join(SECURE_ROOT, relative_path))
-    if not absolute.startswith(SECURE_ROOT + os.sep):
-        raise ValueError('Invalid document path.')
-    return absolute if os.path.isfile(absolute) else None
+    if absolute.startswith(SECURE_ROOT + os.sep) and os.path.isfile(absolute):
+        return absolute
+    fallback = os.path.abspath(os.path.join(LOCAL_FALLBACK_ROOT, relative_path))
+    if fallback.startswith(LOCAL_FALLBACK_ROOT + os.sep) and os.path.isfile(fallback):
+        return fallback
+    return None
+
+
+def _read_document_bytes(relative_path: Optional[str]) -> Optional[bytes]:
+    """Read document bytes from disk or DB blob store."""
+    if not relative_path:
+        return None
+    absolute = os.path.abspath(os.path.join(SECURE_ROOT, relative_path))
+    fallback = os.path.abspath(os.path.join(LOCAL_FALLBACK_ROOT, relative_path))
+    storage_key = f"fir_documents/{relative_path}"
+    disk_path = absolute if os.path.isfile(absolute) else (fallback if os.path.isfile(fallback) else None)
+    return read_file_with_fallback(disk_path, storage_key)
 
 
 def _load_fir(fir_id: str) -> Optional[Dict[str, Any]]:
@@ -436,9 +454,9 @@ def generate_fir_pdf(fir_id: str, actor_user: Dict[str, Any], force: bool = Fals
     os.makedirs(folder, exist_ok=True)
     filename = f"{_safe_filename(fir['fir_number'])}-v{version}.pdf"
     absolute_path = os.path.join(folder, filename)
-    with open(absolute_path, 'wb') as handle:
-        handle.write(pdf_bytes)
     relative_path = f"{fir_id}/{filename}"
+    storage_key = f"fir_documents/{relative_path}"
+    write_file_with_blob(absolute_path, pdf_bytes, storage_key, 'application/pdf')
 
     doc_id = f"fdoc-{uuid.uuid4().hex[:12]}"
     cursor.execute(

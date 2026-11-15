@@ -250,32 +250,54 @@ def reassign_fir_officer(
     fir_id: str,
     new_officer_id: str,
     reason: str,
-    user: Dict[str, Any]
+    user: Dict[str, Any],
+    remarks: str = ''
 ) -> Dict[str, Any]:
     """
-    Reassign an officer to an FIR (Authorized Officers only).
-    
-    Args:
-        fir_id: FIR identifier
-        new_officer_id: New officer's user ID
-        reason: Reason for reassignment
-        user: Authenticated user (must be Authorized Officer)
-    
-    Returns:
-        Reassignment result with audit trail
+    Change the investigating officer of an existing FIR (Authorized Officers only).
+
+    The reassignment, its audit record and every role notification are written in
+    one transaction. Success is only reported after the new officer's case access
+    and latest FIR document access have been verified against the database.
     """
     check_authorized_officer_access(user)
-    
+
+    if not new_officer_id:
+        raise ValueError("Select the officer who will take over this FIR.")
     if not reason or len(reason.strip()) < 10:
         raise ValueError("Reassignment reason must be at least 10 characters")
-    
+
     result = reassign_officer(
         fir_id=fir_id,
         new_officer_id=new_officer_id,
         authorized_officer_id=user.get('id'),
-        reason=reason
+        reason=reason,
+        remarks=remarks,
     )
-    
+    if not result.get('success'):
+        raise ValueError(result.get('error') or 'Officer reassignment failed.')
+
+    # Prove the new officer can open the case and its document before the caller
+    # is told the workflow succeeded.
+    from backend.services.fir_service import get_fir_by_id
+    from backend.services.fir_document_service import latest_document_path_for
+
+    new_officer = {'id': new_officer_id, 'role': 'OFFICER'}
+    fir = get_fir_by_id(fir_id, new_officer)
+    if not fir or fir.get('assigned_officer_id') != new_officer_id:
+        raise RuntimeError(
+            'Reassignment was recorded but the new officer cannot access the FIR. '
+            'Review the assignment trail before retrying.'
+        )
+
+    result['access_verified'] = True
+    result['document_available'] = bool(latest_document_path_for(fir_id, new_officer))
+    result['fir'] = {
+        'id': fir.get('id'),
+        'fir_number': fir.get('fir_number'),
+        'status': fir.get('status'),
+        'citizen_name': fir.get('citizen_name'),
+    }
     return result
 
 

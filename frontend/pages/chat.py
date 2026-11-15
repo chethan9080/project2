@@ -11,6 +11,7 @@ ever reaches the citizens whose cases are assigned to them. New messages reach
 open pages through the in-process event bus, so nobody has to refresh.
 """
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from nicegui import background_tasks, ui
@@ -65,17 +66,22 @@ def _listen(client, task_name: str, is_relevant, refresh) -> None:
 
     async def listen_for_events() -> None:
         while True:
-            event = await queue.get()
-            event_type = event.get('type')
-            if event_type not in ('CHAT_MESSAGE', 'CHAT_READ'):
-                if event_type != 'NOTIFICATION_CREATED':
+            try:
+                event = await queue.get()
+                event_type = event.get('type')
+                if event_type not in ('CHAT_MESSAGE', 'CHAT_READ'):
+                    if event_type != 'NOTIFICATION_CREATED':
+                        continue
+                    if (event.get('notification') or {}).get('type') != 'CHAT_MESSAGE':
+                        continue
+                if not is_relevant(event):
                     continue
-                if (event.get('notification') or {}).get('type') != 'CHAT_MESSAGE':
-                    continue
-            if not is_relevant(event):
-                continue
-            with client:
-                refresh()
+                with client:
+                    refresh()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
 
     listener = background_tasks.create(listen_for_events(), name=task_name)
 
@@ -218,7 +224,7 @@ def _render_chat_thread(case_id: str, current_user: Dict[str, Any], is_complaint
         return bool(event.get('user_id') in participants)
 
     _listen(ui.context.client, f'chat-thread-{case_id}', relevant, thread_view.refresh)
-    ui.timer(25.0, thread_view.refresh)
+    ui.timer(2.0, thread_view.refresh)
 
 
 # ─────────────────────────────────────────────────────────
@@ -227,7 +233,11 @@ def _render_chat_thread(case_id: str, current_user: Dict[str, Any], is_complaint
 
 def _render_conversation_hub(user: Dict[str, Any], role: str) -> None:
     is_officer = role == 'officer'
-    create_sidebar('police' if is_officer else 'citizen', '/police/chat' if is_officer else '/citizen/chat')
+    create_sidebar(
+        'police' if is_officer else 'citizen',
+        '/police/chat' if is_officer else '/citizen/chat',
+        show_back=True,
+    )
 
     with ui.column().classes('w-full max-w-6xl mx-auto p-6 gap-5'):
         with ui.row().classes('items-center gap-3'):
@@ -322,7 +332,7 @@ def _render_conversation_hub(user: Dict[str, Any], role: str) -> None:
                                   event.get('citizen_id'), event.get('officer_id'), event.get('user_id')}
 
         _listen(ui.context.client, f'chat-hub-{role}', relevant, conversations_view.refresh)
-        ui.timer(25.0, conversations_view.refresh)
+        ui.timer(2.5, conversations_view.refresh)
 
 
 # ─────────────────────────────────────────────────────────
@@ -346,7 +356,7 @@ def citizen_chat_thread(fir_id: str) -> None:
     user = _require_active_citizen()
     if not user:
         return
-    create_sidebar('citizen', '/citizen/chat')
+    create_sidebar('citizen', '/citizen/chat', show_back=True)
     with ui.column().classes('w-full max-w-4xl mx-auto p-6 gap-4'):
         _render_chat_thread(fir_id, user, False, '/citizen/chat')
 
@@ -358,7 +368,7 @@ def citizen_complaint_chat_thread(complaint_id: str) -> None:
     user = _require_active_citizen()
     if not user:
         return
-    create_sidebar('citizen', '/citizen/complaints')
+    create_sidebar('citizen', '/citizen/complaints', show_back=True)
     with ui.column().classes('w-full max-w-4xl mx-auto p-6 gap-4'):
         _render_chat_thread(complaint_id, user, True, '/citizen/complaints')
 
@@ -384,7 +394,7 @@ def officer_chat_thread(fir_id: str) -> None:
     user = _require_officer()
     if not user:
         return
-    create_sidebar('police', '/police/chat')
+    create_sidebar('police', '/police/chat', show_back=True)
     with ui.column().classes('w-full max-w-4xl mx-auto p-6 gap-4'):
         _render_chat_thread(fir_id, user, False, '/police/chat')
 
@@ -396,6 +406,6 @@ def officer_complaint_chat_thread(complaint_id: str) -> None:
     user = _require_officer()
     if not user:
         return
-    create_sidebar('police', '/police/chat')
+    create_sidebar('police', '/police/chat', show_back=True)
     with ui.column().classes('w-full max-w-4xl mx-auto p-6 gap-4'):
         _render_chat_thread(complaint_id, user, True, '/police/chat')

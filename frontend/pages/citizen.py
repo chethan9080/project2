@@ -7,6 +7,7 @@ their own complaints, FIRs, notifications and conversations; hashes, block
 identifiers and internal verification remarks are never rendered here.
 """
 
+import asyncio
 import base64
 import json
 import os
@@ -399,15 +400,20 @@ def citizen_dashboard() -> None:
 
         async def listen_for_updates() -> None:
             while True:
-                event = await queue.get()
-                event_type = event.get('type')
-                if event_type not in ('COMPLAINT_UPDATED', 'NOTIFICATION_CREATED', 'NOTIFICATION_UPDATED', 'CITIZEN_APPLICATION_UPDATED', 'CASE_STAGE_UPDATED', 'FIR_UPDATED'):
-                    continue
-                owner = event.get('citizen_id') or event.get('user_id')
-                if owner and owner != user_id:
-                    continue
-                with client:
-                    dashboard_content.refresh()
+                try:
+                    event = await queue.get()
+                    event_type = event.get('type')
+                    if event_type not in ('COMPLAINT_UPDATED', 'NOTIFICATION_CREATED', 'NOTIFICATION_UPDATED', 'CITIZEN_APPLICATION_UPDATED', 'CASE_STAGE_UPDATED', 'FIR_UPDATED'):
+                        continue
+                    owner = event.get('citizen_id') or event.get('user_id')
+                    if owner and owner != user_id:
+                        continue
+                    with client:
+                        dashboard_content.refresh()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    await asyncio.sleep(0.5)
 
         listener = background_tasks.create(listen_for_updates(), name='citizen-dashboard-events')
 
@@ -416,7 +422,7 @@ def citizen_dashboard() -> None:
             listener.cancel()
 
         client.on_disconnect(stop_listener)
-        ui.timer(15.0, dashboard_content.refresh)
+        ui.timer(3.0, dashboard_content.refresh)
 
 
 # ==========================================
@@ -885,14 +891,19 @@ def citizen_complaints_list_page(active_path: str = '/citizen/complaints') -> No
 
         async def listen_for_updates() -> None:
             while True:
-                event = await queue.get()
-                if event.get('type') not in ('COMPLAINT_UPDATED', 'CASE_STAGE_UPDATED', 'FIR_UPDATED'):
-                    continue
-                owner = event.get('citizen_id') or event.get('user_id')
-                if owner and owner != user_id:
-                    continue
-                with client:
-                    complaints_body.refresh()
+                try:
+                    event = await queue.get()
+                    if event.get('type') not in ('COMPLAINT_UPDATED', 'CASE_STAGE_UPDATED', 'FIR_UPDATED'):
+                        continue
+                    owner = event.get('citizen_id') or event.get('user_id')
+                    if owner and owner != user_id:
+                        continue
+                    with client:
+                        complaints_body.refresh()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    await asyncio.sleep(0.5)
 
         listener = background_tasks.create(listen_for_updates(), name='citizen-complaints-events')
 
@@ -901,7 +912,7 @@ def citizen_complaints_list_page(active_path: str = '/citizen/complaints') -> No
             listener.cancel()
 
         client.on_disconnect(stop_listener)
-        ui.timer(15.0, complaints_body.refresh)
+        ui.timer(3.0, complaints_body.refresh)
 
 
 @ui.page('/citizen/my-firs')
@@ -1213,13 +1224,33 @@ def citizen_notifications_page() -> None:
                                 reference = notif.get('fir_number') or notif.get('complaint_reference')
                                 if reference:
                                     ui.label(f"Reference: {reference}").classes('text-[10px] font-bold text-slate-500 font-mono')
+                                case_fir_id = notif.get('case_fir_id')
+
+                                def open_notification_target(url: str, nid: str) -> None:
+                                    mark_notification_read(nid, user_id)
+                                    ui.navigate.to(url)
+
+                                if case_fir_id:
+                                    with ui.row().classes('w-full items-center gap-2 pt-1 flex-wrap'):
+                                        ui.button(
+                                            'Open FIR & Track Case', icon='open_in_new',
+                                            on_click=lambda url=f'/citizen/fir/{case_fir_id}/track', nid=notif.get('id'): open_notification_target(url, nid),
+                                        ).props('flat no-caps dense size=sm').classes('text-emerald-800 font-bold text-[11px]')
+                                        ui.button(
+                                            'Open Chat', icon='chat',
+                                            on_click=lambda url=f'/citizen/chat/{case_fir_id}', nid=notif.get('id'): open_notification_target(url, nid),
+                                        ).props('flat no-caps dense size=sm').classes('text-blue-800 font-bold text-[11px]')
+                                elif notif.get('complaint_id'):
+                                    ui.button(
+                                        'Open Complaint', icon='open_in_new',
+                                        on_click=lambda url=f"/citizen/complaint/{notif.get('complaint_id')}", nid=notif.get('id'): open_notification_target(url, nid),
+                                    ).props('flat no-caps dense size=sm').classes('text-emerald-800 font-bold text-[11px] pt-1')
                             if not is_read:
                                 ui.button(icon='mark_email_read', on_click=lambda nid=notif.get('id'): handle_read(nid)).props('flat round dense size=sm').classes('text-emerald-700').tooltip('Mark as read')
 
         notifications_body()
-        # Push events are dropped while a tab is reconnecting, so the inbox also
-        # re-reads the stored records periodically and cannot miss an update.
-        ui.timer(30.0, notifications_body.refresh)
+        # Re-read stored records periodically so notifications stay fresh across sessions
+        ui.timer(3.0, notifications_body.refresh)
 
         existing = get_user_notifications(user_id, limit=1)
         last_seen['id'] = existing[0].get('id') if existing else None
@@ -1227,19 +1258,24 @@ def citizen_notifications_page() -> None:
 
         async def listen_for_notifications() -> None:
             while True:
-                event = await queue.get()
-                if event.get('type') != 'NOTIFICATION_CREATED':
-                    continue
-                if event.get('user_id') != user_id:
-                    continue
-                notification = event.get('notification') or {}
-                if notification.get('id') == last_seen['id']:
-                    continue
-                last_seen['id'] = notification.get('id')
-                with client:
-                    notifications_body.refresh()
-                    ui.notify(notification.get('title') or 'New notification', type='info')
-                    play_sound()
+                try:
+                    event = await queue.get()
+                    if event.get('type') != 'NOTIFICATION_CREATED':
+                        continue
+                    if event.get('user_id') != user_id:
+                        continue
+                    notification = event.get('notification') or {}
+                    if notification.get('id') == last_seen['id']:
+                        continue
+                    last_seen['id'] = notification.get('id')
+                    with client:
+                        notifications_body.refresh()
+                        ui.notify(notification.get('title') or 'New notification', type='info')
+                        play_sound()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    await asyncio.sleep(0.5)
 
         listener = background_tasks.create(listen_for_notifications(), name='citizen-notification-events')
 

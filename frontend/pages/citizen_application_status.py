@@ -198,6 +198,39 @@ def citizen_application_status_page() -> None:
         if state['application'] is None and ref_input.value and ident_input.value:
             run_lookup()
 
+        def refresh_from_database() -> None:
+            """Resynchronise from SQLite in case a push event was missed.
+
+            The event bus is the fast path; this timer guarantees an officer
+            decision still appears on a long-lived tab after a reconnect or a
+            server restart, without the person pressing Check Status again.
+            """
+            application = state['application']
+            if not application:
+                return
+            reference = storage.get('pending_application_reference') or application.get('reference')
+            identifier = storage.get('pending_application_email') or application.get('email')
+            if not reference or not identifier:
+                return
+            refreshed = find_application_for_status(reference, identifier)
+            if not refreshed:
+                return
+            if (
+                refreshed.get('status') == application.get('status')
+                and refreshed.get('updated_at') == application.get('updated_at')
+            ):
+                return
+            status_changed = refreshed.get('status') != application.get('status')
+            state['application'] = refreshed
+            render_result()
+            if status_changed:
+                ui.notify(
+                    f"Registration status updated: {status_label(refreshed.get('status'))}",
+                    type='positive' if refreshed.get('status') == 'APPROVED' else 'info',
+                )
+
+        ui.timer(8.0, refresh_from_database)
+
         client = ui.context.client
         event_queue = subscribe()
 

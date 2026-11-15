@@ -158,6 +158,9 @@ def init_database() -> None:
         assigned_by TEXT NOT NULL,
         assigned_at TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'REASSIGNED', 'COMPLETED')),
+        reason TEXT,
+        remarks TEXT,
+        revoked_at TEXT,
         FOREIGN KEY (fir_id) REFERENCES firs(id),
         FOREIGN KEY (officer_id) REFERENCES users(id),
         FOREIGN KEY (assigned_by) REFERENCES users(id)
@@ -634,17 +637,29 @@ def init_database() -> None:
         file_size INTEGER,
         sha256 TEXT,
         created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
         FOREIGN KEY (fir_id) REFERENCES firs(id),
         FOREIGN KEY (officer_id) REFERENCES users(id)
     );
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_investigation_fir ON investigation_entries(fir_id, created_at);")
 
+    # Migration: investigation entries gained updated_at (evidence status changes).
+    # Existing databases were created without it, so the ALTER backfills from created_at.
+    add_col_if_missing("investigation_entries", "updated_at TEXT NOT NULL DEFAULT ''")
+    cursor.execute("UPDATE investigation_entries SET updated_at = created_at WHERE updated_at = ''")
+
     # Migration: ensure chat_messages has complaint_id column
     add_col_if_missing("chat_messages", "complaint_id TEXT")
 
     # Migration: ensure firs table has complaint_id column (complaint→FIR traceability)
     add_col_if_missing("firs", "complaint_id TEXT")
+
+    # Migration: assignment records preserve the reassignment reason, the Authorized
+    # Officer's remarks and the exact moment the previous officer's access ended.
+    add_col_if_missing("officer_assignments", "reason TEXT")
+    add_col_if_missing("officer_assignments", "remarks TEXT")
+    add_col_if_missing("officer_assignments", "revoked_at TEXT")
 
     # Migration: complaint verification decision fields (Verification Officer desk)
     add_col_if_missing("complaints", "verification_status TEXT NOT NULL DEFAULT 'PENDING'")

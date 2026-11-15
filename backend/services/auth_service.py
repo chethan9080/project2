@@ -22,6 +22,60 @@ _active_sessions: Dict[str, Dict[str, Any]] = {}
 _current_user_context: Optional[Dict[str, Any]] = None
 
 
+def mask_user_gov_id(gov_id: Optional[str]) -> Optional[str]:
+    """Mask a Government ID before it is stored on the users table."""
+    if not gov_id:
+        return None
+    clean_id = gov_id.strip()
+    if len(clean_id) >= 4:
+        return f"XXXX-XXXX-{clean_id[-4:]}"
+    return "XXXX-XXXX-XXXX"
+
+
+def insert_user_row(
+    cursor,
+    *,
+    name: str,
+    email: str,
+    phone: str,
+    password: str,
+    role: str = "CITIZEN",
+    badge_number: Optional[str] = None,
+    station: Optional[str] = None,
+    rank: Optional[str] = None,
+    district: Optional[str] = None,
+    address: Optional[str] = None,
+    gov_id: Optional[str] = None,
+    status: str = "ACTIVE",
+) -> str:
+    """Insert one user row on the caller's connection and return the new id.
+
+    The caller owns the transaction, which lets registration commit the user,
+    application and audit rows together.
+    """
+    email_clean = email.strip().lower()
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1", (email_clean,))
+    if cursor.fetchone():
+        raise ValueError(f"User with email '{email_clean}' already exists.")
+
+    password_hash, salt = hash_password(password)
+    user_id = f"usr-{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    cursor.execute("""
+        INSERT INTO users (
+            id, name, email, phone, password_hash, salt, role, status,
+            badge_number, station, rank, district, address, gov_id_masked,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, name.strip(), email_clean, phone.strip(), password_hash, salt,
+        role.upper(), status.upper(), badge_number, station, rank, district, address,
+        mask_user_gov_id(gov_id), now, now
+    ))
+    return user_id
+
+
 def register_user(
     name: str,
     email: str,
@@ -39,42 +93,20 @@ def register_user(
     """Register a new user in the system with secure PBKDF2 password hashing."""
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    email_clean = email.strip().lower()
-    cursor.execute("SELECT id FROM users WHERE email = ?", (email_clean,))
-    if cursor.fetchone():
+    try:
+        user_id = insert_user_row(
+            cursor,
+            name=name, email=email, phone=phone, password=password, role=role,
+            badge_number=badge_number, station=station, rank=rank, district=district,
+            address=address, gov_id=gov_id, status=status,
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+    finally:
         conn.close()
-        raise ValueError(f"User with email '{email_clean}' already exists.")
 
-    password_hash, salt = hash_password(password)
-    user_id = f"usr-{uuid.uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
-
-    gov_id_masked = None
-    if gov_id:
-        clean_id = gov_id.strip()
-        if len(clean_id) >= 4:
-            gov_id_masked = f"XXXX-XXXX-{clean_id[-4:]}"
-        else:
-            gov_id_masked = "XXXX-XXXX-XXXX"
-
-    cursor.execute("""
-        INSERT INTO users (
-            id, name, email, phone, password_hash, salt, role, status,
-            badge_number, station, rank, district, address, gov_id_masked,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id, name.strip(), email_clean, phone.strip(), password_hash, salt,
-        role.upper(), status.upper(), badge_number, station, rank, district, address,
-        gov_id_masked, now, now
-    ))
-
-    conn.commit()
-    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    user = dict(cursor.fetchone())
-    conn.close()
-
+    user = dict(row)
     user.pop("password_hash", None)
     user.pop("salt", None)
     return user
@@ -298,14 +330,25 @@ def get_current_user() -> Optional[Dict[str, Any]]:
     """Retrieve the active user for the current browser session.
 
     When called inside a UI request the per-session storage is authoritative, so
-    two browsers signed in as different roles never share a login. Outside a UI
-    request (unit tests, scripts) the in-memory context is used instead.
+    two browsers signed in as different roles never share a login. Re-reads the
+    account from the database so profile and status updates made in another session
+    are immediately visible without requiring re-login.
     """
     global _current_user_context
     storage = _session_storage()
-    if storage is not None:
-        return storage.get('current_user')
-    return _current_user_context
+    cached = storage.get('current_user') if storage is not None else _current_user_context
+    if not cached or not isinstance(cached, dict) or not cached.get('id'):
+        return cached
+
+    # Re-fetch latest user record from central database to keep multiple sessions synchronized
+    fresh = get_user_by_id(cached['id'])
+    if fresh:
+        fresh.pop('password_hash', None)
+        fresh.pop('salt', None)
+        if storage is not None:
+            storage['current_user'] = fresh
+        return fresh
+    return cached
 
 
 def get_session_user_strict() -> Optional[Dict[str, Any]]:
@@ -529,6 +572,9 @@ def is_assigned_case_handler(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
     """
     True for the officer assigned to the FIR or a supervisor of the same station.
     Grants case-handling access; it deliberately does NOT grant forensic audit access.
+
+    An officer whose assignment on this FIR was revoked by a reassignment never
+    regains case access through the station-supervisor rule.
     """
     if not user or not fir:
         return False
@@ -537,8 +583,22 @@ def is_assigned_case_handler(user: Dict[str, Any], fir: Dict[str, Any]) -> bool:
 
     user_id = user.get("id")
     assigned_id = fir.get("assigned_officer_id") or fir.get("assignedOfficerId")
+    fir_id = fir.get("id") or fir.get("fir_id")
     if assigned_id and assigned_id == user_id:
         return True
+
+    if fir_id:
+        conn = get_db_connection()
+        try:
+            revoked = conn.execute(
+                "SELECT 1 FROM officer_assignments "
+                "WHERE fir_id = ? AND officer_id = ? AND status = 'REASSIGNED' LIMIT 1",
+                (fir_id, user_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if revoked:
+            return False
 
     return fir.get("police_station") == user.get("station") and user.get("rank") in (
         "Police Inspector", "Circle Inspector", "Station House Officer (SHO)"

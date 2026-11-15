@@ -35,3 +35,4 @@ data/secure_uploads/
 all_frontend_ui_strings.json
 filtered_ui_strings.json
 scratch_ui_strings.json
+LOGIN_CREDENTIALS.md

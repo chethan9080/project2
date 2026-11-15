@@ -2,6 +2,7 @@
 Administrator / Supervisor Portal - System Overview, Officer Management, Blockchain Explorer, and Audit Logs.
 """
 
+import asyncio
 import base64
 import json
 from typing import Any, Dict, List, Optional
@@ -28,7 +29,9 @@ from data.integrity import get_hash_chain_status
 from backend.services.authorized_officer_service import (
     get_complete_fir_case_history,
     get_citizen_complete_dossier,
+    reassign_fir_officer,
 )
+from data.authorized_officer import REASSIGNMENT_REASONS
 from backend.services.complaint_evidence_service import evidence_bytes
 from backend.services.blockchain_service import (
     get_blockchain_ledger,
@@ -65,6 +68,138 @@ def require_admin_user():
         ui.navigate.to('/staff-portal')
         return None
     return user
+
+
+def _change_officer_context(fir_id: str) -> Optional[Dict[str, Any]]:
+    """Load the minimum case facts shown in the Change Officer confirmation."""
+    conn = get_db_connection()
+    try:
+        row = conn.execute("""
+            SELECT f.id, f.fir_number, f.status, f.citizen_id, f.assigned_officer_id,
+                   f.complaint_id, cu.name AS citizen_name,
+                   c.reference AS complaint_reference,
+                   ou.name AS officer_name, ou.badge_number AS officer_badge
+            FROM firs f
+            LEFT JOIN users cu ON f.citizen_id = cu.id
+            LEFT JOIN users ou ON f.assigned_officer_id = ou.id
+            LEFT JOIN complaints c ON f.complaint_id = c.id
+            WHERE f.id = ?
+        """, (fir_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def open_change_officer_dialog(fir_id: str, user: Dict[str, Any], on_success=None) -> None:
+    """Authorized Officer workflow to move an existing FIR to another officer.
+
+    The dialog never creates a new FIR: it changes the active assignment on the
+    existing case and shows success only after the backend has verified that the
+    new officer can open the FIR and its latest document.
+    """
+    case = _change_officer_context(fir_id)
+    if not case:
+        ui.notify('FIR not found.', type='negative')
+        return
+
+    officers = [
+        {
+            'id': officer['id'],
+            'label': (
+                f"{officer.get('rank') or 'Officer'} {officer['name']} "
+                f"(Badge {officer.get('badge_number') or 'N/A'} · {officer.get('station') or 'Station N/A'})"
+            ),
+        }
+        for officer in get_all_officers()
+        if officer['id'] != case.get('assigned_officer_id')
+    ]
+    officer_options = {officer['id']: officer['label'] for officer in officers}
+
+    dialog = ui.dialog()
+    with dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-3xl gap-3'):
+        with ui.row().classes('w-full items-center gap-3 pb-2 border-b border-slate-200'):
+            ui.icon('swap_horiz', size='md').classes('text-indigo-800')
+            with ui.column().classes('gap-0'):
+                ui.label('Change Investigating Officer').classes('text-xl font-black text-slate-900 fantasy-title')
+                ui.label('The FIR number, documents, evidence and history stay unchanged.').classes('text-xs text-slate-500')
+
+        with ui.card().classes('w-full p-3 bg-slate-50 border border-slate-200 rounded-2xl gap-1'):
+            ui.label(f"FIR {case.get('fir_number')}").classes('text-sm font-black text-slate-900 font-mono')
+            ui.label(f"Citizen: {case.get('citizen_name') or 'Not recorded'}").classes('text-xs text-slate-700')
+            ui.label(f"Complaint Ref: {case.get('complaint_reference') or '—'}").classes('text-xs text-slate-500 font-mono')
+            ui.label(
+                f"Current Officer: {case.get('officer_name') or 'Not assigned'}"
+                f"{' (Badge ' + str(case.get('officer_badge')) + ')' if case.get('officer_badge') else ''}"
+            ).classes('text-xs font-bold text-indigo-800')
+
+        if not officer_options:
+            ui.label('No other active police officer is available for reassignment.').classes('text-sm text-amber-700 font-bold')
+            ui.button('Close', on_click=dialog.close).props('flat').classes('self-end')
+            dialog.open()
+            return
+
+        officer_select = ui.select(officer_options, label='New Investigating Officer').props('outlined').classes('w-full')
+        reason_select = ui.select(
+            list(REASSIGNMENT_REASONS),
+            label='Reassignment Reason',
+        ).props('outlined').classes('w-full')
+        remarks_input = ui.textarea(
+            label='Remarks (optional, internal audit only)',
+            placeholder='Context for the takeover, e.g. pending evidence review or supervision instruction.',
+        ).props('outlined autogrow').classes('w-full')
+        confirm_box = ui.checkbox(
+            'I confirm this officer is eligible and should take over the existing FIR.'
+        ).classes('text-xs text-slate-700')
+        status_label = ui.label('').classes('text-xs font-bold text-rose-600')
+
+        def submit() -> None:
+            status_label.text = ''
+            if not officer_select.value:
+                status_label.text = 'Select the new investigating officer.'
+                return
+            if not reason_select.value:
+                status_label.text = 'Select a reassignment reason.'
+                return
+            if not confirm_box.value:
+                status_label.text = 'Confirm the reassignment before continuing.'
+                return
+            try:
+                result = reassign_fir_officer(
+                    fir_id,
+                    officer_select.value,
+                    reason_select.value,
+                    user,
+                    remarks_input.value or '',
+                )
+            except (PermissionError, ValueError) as exc:
+                status_label.text = str(exc)
+                return
+            except Exception as exc:
+                status_label.text = f'Reassignment failed: {exc}'
+                return
+
+            if not result.get('access_verified'):
+                status_label.text = 'The case was not confirmed as accessible to the new officer. Reassignment is not reported as successful.'
+                return
+
+            dialog.close()
+            new_officer = result.get('new_officer') or {}
+            ui.notify(
+                f"FIR {case.get('fir_number')} reassigned to {new_officer.get('name', 'the new officer')}. "
+                'The officer and the citizen were notified.',
+                type='positive',
+                position='top-right',
+            )
+            if on_success:
+                on_success(result)
+
+        with ui.row().classes('w-full items-center justify-end gap-2 pt-2'):
+            ui.button('Cancel', on_click=dialog.close).props('flat no-caps').classes('text-slate-600 font-bold')
+            ui.button('Confirm Reassignment', icon='how_to_reg', on_click=submit).props('unelevated no-caps').classes(
+                'bg-indigo-900 text-white font-bold rounded-xl'
+            )
+
+    dialog.open()
 
 
 @ui.page('/admin')
@@ -488,7 +623,7 @@ def admin_officers_page() -> None:
 
         directory()
         _mon_listen(directory)
-        ui.timer(30, directory.refresh)
+        ui.timer(3, directory.refresh)
 
 
 # ==========================================
@@ -1126,14 +1261,23 @@ def admin_fir_case_full_history_page(fir_id: str) -> None:
 
         # ── SECTION 8: ASSIGNED POLICE OFFICER & ASSIGNMENT TRAIL ──────────────
         with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
-            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3'):
+            with ui.row().classes('w-full items-center justify-between pb-3 border-b border-slate-200 mb-3 flex-wrap gap-2'):
                 with ui.row().classes('items-center gap-2'):
                     ui.icon('assignment_ind', size='sm').classes('text-indigo-800')
                     ui.label('4. Assigned Investigating Officer & Assignment Trail').classes('text-base font-black text-slate-900 fantasy-title')
-                if curr_assign:
-                    ui.badge('Active Assignment').classes('bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[10px] px-2 py-0.5 rounded-full')
-                else:
-                    ui.badge('Pending Officer Assignment').classes('bg-amber-100 text-amber-900 border border-amber-300 font-bold text-[10px] px-2 py-0.5 rounded-full')
+                with ui.row().classes('items-center gap-2 flex-wrap'):
+                    if curr_assign:
+                        ui.badge('Active Assignment').classes('bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[10px] px-2 py-0.5 rounded-full')
+                    else:
+                        ui.badge('Pending Officer Assignment').classes('bg-amber-100 text-amber-900 border border-amber-300 font-bold text-[10px] px-2 py-0.5 rounded-full')
+                    ui.button(
+                        'Change Officer',
+                        icon='swap_horiz',
+                        on_click=lambda fid=actual_fir_id: open_change_officer_dialog(
+                            fid, user,
+                            on_success=lambda _result: ui.navigate.to(f'/admin/fir-cases/{fid}/full'),
+                        ),
+                    ).props('unelevated size=sm').classes('bg-indigo-900 text-white font-bold rounded-xl text-xs px-3 py-1')
 
             if curr_assign:
                 with ui.row().classes('w-full flex-wrap gap-4 text-xs'):
@@ -1151,9 +1295,15 @@ def admin_fir_case_full_history_page(fir_id: str) -> None:
                 ui.label('Historical Assignment Chain:').classes('text-[10px] font-black text-slate-500 uppercase tracking-wider mt-3 mb-1')
                 with ui.column().classes('w-full gap-1'):
                     for a in all_assign:
-                        with ui.row().classes('w-full items-center justify-between p-2 rounded-xl bg-slate-50 text-[11px]'):
-                            ui.label(f"{a.get('officer_name')} ({a.get('officer_badge')}) · Assigned {_mon_fmt(a.get('assigned_at'))} by {a.get('assigner_name') or 'Verification Desk'}").classes('text-slate-800')
-                            ui.badge(a.get('status', 'ACTIVE')).classes('bg-slate-200 text-slate-700 text-[9px] font-bold')
+                        with ui.column().classes('w-full p-2 rounded-xl bg-slate-50 text-[11px] gap-0.5'):
+                            with ui.row().classes('w-full items-center justify-between gap-2 flex-wrap'):
+                                ui.label(f"{a.get('officer_name')} ({a.get('officer_badge')}) · Assigned {_mon_fmt(a.get('assigned_at'))} by {a.get('assigner_name') or 'Verification Desk'}").classes('text-slate-800')
+                                with ui.row().classes('items-center gap-2'):
+                                    if a.get('revoked_at'):
+                                        ui.label(f"Access ended {_mon_fmt(a.get('revoked_at'))}").classes('text-[10px] font-mono text-rose-700')
+                                    ui.badge(a.get('status', 'ACTIVE')).classes('bg-slate-200 text-slate-700 text-[9px] font-bold')
+                            if a.get('reason'):
+                                ui.label(f"Reason: {a.get('reason')}").classes('text-[10px] text-slate-600 italic')
 
         # ── SECTION 9: 10-STAGE INVESTIGATION PROGRESSION ──────────────────────
         with ui.card().classes('w-full p-6 paper-card bg-white border border-slate-200 rounded-3xl shadow-sm mb-4'):
@@ -1768,11 +1918,64 @@ def admin_audit_event_detail_page(event_id: str) -> None:
     new_vals = ev.get('new_values', {})
     ts = str(ev.get('timestamp', ''))[:19]
 
+    # Cryptographic classification. A hash divergence is evidence to investigate,
+    # not proof that the officer named in the audit event acted dishonestly.
+    try:
+        integrity = verify_fir_integrity(ev.get('fir_id')) if ev.get('fir_id') else {}
+    except Exception:
+        integrity = {}
+    if integrity.get('is_valid'):
+        review_badge = 'INTEGRITY VERIFIED'
+        review_classes = 'bg-emerald-50 border-emerald-300 text-emerald-900'
+        review_note = (
+            'The live FIR record matches the immutable ledger proof for this case. '
+            'The event below is an authorized, recorded update; no tampering is established.'
+        )
+    elif integrity.get('status') == 'TAMPER_DETECTED':
+        review_badge = 'SUSPECTED TAMPERING - REVIEW REQUIRED'
+        review_classes = 'bg-rose-50 border-rose-300 text-rose-900'
+        review_note = (
+            'The live database record no longer matches the immutable ledger proof. This is a '
+            'suspected integrity breach: confirm the cause from the full audit trail, documents and '
+            'officer actions before drawing any conclusion. A hash mismatch alone does not establish '
+            'that an officer is responsible.'
+        )
+    else:
+        review_badge = 'UNVERIFIED - SUSPECTED UNTIL REVIEWED'
+        review_classes = 'bg-amber-50 border-amber-300 text-amber-900'
+        review_note = (
+            'No valid ledger proof could be matched to the current record. Treat the case as '
+            'suspected until the original document, versions and audit trail are reviewed.'
+        )
+
     with portal_page('admin', '/admin/tampering-audit', f"Audit Detail: {ev.get('event_number', event_id)}", f"FIR: {ev.get('fir_number', '—')}"):
 
         ui.button('← Back to Audit Trail', icon='arrow_back',
             on_click=lambda: ui.navigate.to('/admin/tampering-audit')
         ).props('flat').classes('text-slate-600 font-bold mb-4')
+
+        with ui.card().classes(f'w-full p-4 border rounded-2xl mb-4 {review_classes}'):
+            with ui.row().classes('w-full items-start gap-3'):
+                ui.icon('verified_user' if integrity.get('is_valid') else 'report_problem', size='sm').classes('mt-0.5')
+                with ui.column().classes('gap-1 flex-1'):
+                    ui.badge(review_badge).classes('font-black text-[10px] px-2 py-0.5 rounded-full bg-white/70')
+                    ui.label(review_note).classes('text-xs font-semibold leading-relaxed')
+
+        with ui.row().classes('w-full gap-2 flex-wrap mb-4'):
+            if ev.get('fir_id'):
+                ui.button(
+                    'Open Full Case Record',
+                    icon='folder_open',
+                    on_click=lambda fid=ev.get('fir_id'): ui.navigate.to(f'/admin/fir-cases/{fid}/full'),
+                ).props('unelevated size=sm').classes('bg-slate-800 text-white font-bold rounded-xl text-xs px-3 py-1')
+                ui.button(
+                    'Change Assigned Officer',
+                    icon='swap_horiz',
+                    on_click=lambda fid=ev.get('fir_id'): open_change_officer_dialog(
+                        fid, user,
+                        on_success=lambda _result: ui.navigate.to(f'/admin/fir-cases/{fid}/full'),
+                    ),
+                ).props('unelevated size=sm').classes('bg-indigo-900 text-white font-bold rounded-xl text-xs px-3 py-1')
 
         # Header Card with Tampering ID and FIR Info
         with ui.card().classes('w-full p-6 bg-white border-l-4 border-red-600 rounded-2xl shadow-sm mb-4'):
@@ -1780,7 +1983,7 @@ def admin_audit_event_detail_page(event_id: str) -> None:
                 with ui.row().classes('items-center gap-3'):
                     ui.icon('policy', size='lg').classes('text-red-700')
                     with ui.column().classes('gap-0'):
-                        ui.label(f"Tampering ID: {ev.get('event_number', event_id)}").classes('text-2xl font-black text-slate-900 font-mono')
+                        ui.label(f"Audit Event: {ev.get('event_number', event_id)}").classes('text-2xl font-black text-slate-900 font-mono')
                         ui.label(f"FIR: {ev.get('fir_number', '—')} · Type: {ev.get('incident_type', '—')}").classes('text-sm text-slate-600')
                         if ev.get('citizen_name'):
                             ui.label(f"Citizen: {ev.get('citizen_name')} ({ev.get('citizen_phone', '')})").classes('text-sm font-bold text-emerald-700')
@@ -2151,7 +2354,7 @@ def admin_investigations_page() -> None:
 
         monitor_view()
         _mon_listen(monitor_view)
-        ui.timer(30, monitor_view.refresh)
+        ui.timer(3, monitor_view.refresh)
 
 
 def _mon_detail(label: str, value, *, mono: bool = False) -> None:
@@ -2718,7 +2921,7 @@ def admin_investigation_detail_page(fir_id: str) -> None:
 
         case_view()
         _mon_listen(case_view)
-        ui.timer(25, case_view.refresh)
+        ui.timer(3, case_view.refresh)
 
 
 @ui.page('/admin/profile')
@@ -2969,5 +3172,5 @@ def admin_notifications_page() -> None:
 
         inbox()
         _mon_listen(inbox)
-        ui.timer(25.0, inbox.refresh)
+        ui.timer(3.0, inbox.refresh)
 

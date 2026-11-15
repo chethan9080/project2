@@ -7,6 +7,7 @@ change is written through the investigation service, which keeps the FIR record,
 the versioned ledger, the citizen timeline and the officer credit history in sync.
 """
 
+import asyncio
 import base64
 import json
 
@@ -127,15 +128,21 @@ def _listen(refreshable_fn, event_types=OFFICER_EVENTS, on_event=None) -> None:
 
     async def listener() -> None:
         while True:
-            event = await queue.get()
-            if event.get('type') not in event_types:
-                continue
-            if not client.has_socket_connection:
+            try:
+                event = await queue.get()
+                if event.get('type') not in event_types:
+                    continue
+                if not client.has_socket_connection:
+                    await asyncio.sleep(0.5)
+                    continue
+                with client:
+                    refreshable_fn.refresh()
+                    if on_event:
+                        on_event(event)
+            except asyncio.CancelledError:
                 break
-            with client:
-                refreshable_fn.refresh()
-                if on_event:
-                    on_event(event)
+            except Exception:
+                await asyncio.sleep(0.5)
 
     task = background_tasks.create(listener(), name='police-live-listener')
 
@@ -453,7 +460,7 @@ def police_dashboard() -> None:
                 _alert_sound()
 
         _listen(dashboard_view, on_event=_on_dashboard_event)
-        ui.timer(25.0, dashboard_view.refresh)
+        ui.timer(3.0, dashboard_view.refresh)
 
 
 # ==========================================
@@ -560,7 +567,7 @@ def police_assigned_cases_page() -> None:
         cases_view()
         search.on('update:value', lambda _: cases_view.refresh())
         _listen(cases_view)
-        ui.timer(30.0, cases_view.refresh)
+        ui.timer(3.0, cases_view.refresh)
 
 
 # ==========================================
@@ -1153,6 +1160,7 @@ def police_fir_case_page(fir_id: str) -> None:
 
         case_view()
         _listen(case_view)
+        ui.timer(2.5, case_view.refresh)
 
 
 # ==========================================
@@ -1284,7 +1292,7 @@ def police_notifications_page() -> None:
                 _alert_sound()
 
         _listen(inbox_view, on_event=_on_inbox_event)
-        ui.timer(30.0, inbox_view.refresh)
+        ui.timer(3.0, inbox_view.refresh)
 
 
 # ==========================================

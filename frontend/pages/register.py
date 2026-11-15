@@ -13,11 +13,13 @@ import asyncio
 import base64
 import json
 import os
+import time
 
 from nicegui import ui, app as nicegui_app
 from frontend.components.navbar import create_public_header
-from backend.services.auth_service import register_user, set_current_user, delete_unverified_citizen
-from backend.services.citizen_registration_service import create_citizen_application
+from backend.services.auth_service import set_current_user
+from backend.services.citizen_registration_service import submit_citizen_registration
+from backend.services.config_service import is_test_mode
 from backend.services.verification_service import (
     TEST_MODE_OTP,
     get_otp_session_status,
@@ -27,7 +29,6 @@ from backend.services.verification_service import (
     validate_government_id,
     verify_location_capture,
     verify_otp,
-    record_citizen_verification_event,
 )
 
 GOV_ID_TYPES = ["Aadhaar Card", "Voter ID Card", "Passport"]
@@ -41,7 +42,7 @@ WIZARD_STORAGE_KEY = 'citizen_registration_wizard'
 PERSISTED_STATE_KEYS = (
     's1_name', 's1_email', 's1_dob', 's1_gender',
     's2_gov_id_type', 's2_gov_id', 's2_masked', 's2_doc_name', 's2_doc_ext',
-    's3_mobile', 's3_otp_sent', 's3_otp_verified',
+    's3_mobile', 's3_otp_sent', 's3_otp_verified', 's3_demo_otp', 's3_expires_timestamp',
     's4_photo_label', 's4_photo_ext',
     's5_state', 's5_district', 's5_address', 's5_latitude', 's5_longitude',
     's5_location_verified', 's5_location_name', 'current_step',
@@ -89,7 +90,7 @@ async def create_register_page() -> None:
         's2_doc_bytes': None, 's2_doc_name': '', 's2_doc_ext': '',
         # Step 3
         's3_mobile': '', 's3_otp_sent': False, 's3_otp_verified': False,
-        's3_demo_otp': '',
+        's3_demo_otp': '', 's3_expires_timestamp': 0.0,
         # Step 4
         's4_photo_verified': False, 's4_photo_label': '',
         's4_photo_bytes': None, 's4_photo_ext': '.jpg',
@@ -284,111 +285,187 @@ async def create_register_page() -> None:
             # ╚══════════════════════════════════════╝
             panel3 = ui.card().classes('w-full p-6 rounded-2xl bg-white shadow border border-slate-100').set_visibility(False)
             with panel3:
-                with ui.row().classes('items-center gap-2 mb-4'):
+                with ui.row().classes('items-center gap-2 mb-3'):
                     ui.icon('sms', size='sm').classes('text-blue-700')
                     ui.label('Step 3 — Mobile Number & OTP Verification').classes('font-black text-slate-800 text-lg')
 
-                with ui.card().classes('w-full p-3 bg-green-50 border border-green-200 rounded-xl mb-4'):
-                    ui.label('📱 Why mobile verification is required:').classes('font-bold text-green-900 text-xs mb-1')
-                    ui.label('Two-Factor Authentication (2FA) via mobile OTP ensures that only you can register with your email. Critically, officers and police stations will use this number to contact you for your FIR.').classes('text-xs text-green-800')
+                # Citizen Contact Info Card (Mobile & Email entered by the citizen)
+                with ui.card().classes('w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl mb-3'):
+                    with ui.row().classes('w-full items-center justify-between text-xs flex-wrap gap-2'):
+                        with ui.row().classes('items-center gap-1.5'):
+                            ui.icon('mail', size='xs').classes('text-blue-600')
+                            ui.label('Registered Email:').classes('text-slate-500 font-medium')
+                            ui.label().bind_text_from(state, 's1_email').classes('font-bold text-slate-800')
+                        with ui.row().classes('items-center gap-1.5'):
+                            ui.icon('verified_user', size='xs').classes('text-emerald-600')
+                            ui.label('System:').classes('text-slate-500 font-medium')
+                            ui.label('Free Instant OTP Verification').classes('font-bold text-emerald-700')
+
+                with ui.card().classes('w-full p-3 bg-blue-50 border border-blue-200 rounded-xl mb-3'):
+                    ui.label('📱 Instant Free OTP Verification:').classes('font-bold text-blue-900 text-xs mb-1')
+                    ui.label('Your 6-digit verification OTP will be generated automatically and displayed directly on this screen. Enter the displayed OTP in the verification field below to verify your account.').classes('text-xs text-blue-800')
 
                 s3_mobile_ref = ui.input('Mobile Number *', placeholder='+91 98765 43210').classes('w-full')
-                s3_otp_ref = ui.input('Enter 6-Digit OTP *', placeholder='______').classes('w-full')
-                s3_otp_ref.props('autocomplete=one-time-code maxlength=6')
-                s3_demo_label = ui.label('').classes('text-xs font-mono text-amber-700 font-bold')
-                s3_status = ui.label('').classes('text-xs font-semibold mt-1')
+
+                # Prominent Generated OTP Display Box
+                otp_display_box = ui.card().classes(
+                    'w-full p-4 bg-gradient-to-r from-blue-50 via-indigo-50 to-blue-50 border-2 border-blue-400 rounded-2xl items-center text-center my-3 shadow-sm'
+                )
+                otp_display_box.set_visibility(False)
+                with otp_display_box:
+                    s3_otp_prompt_label = ui.label('Your verification OTP is:').classes('text-xs font-black uppercase tracking-wider text-blue-900')
+                    s3_generated_code_label = ui.label('------').classes('text-3xl sm:text-4xl font-mono font-black text-blue-800 tracking-[0.25em] bg-white px-6 py-2 rounded-xl border border-blue-200 shadow-inner my-1.5')
+                    s3_countdown_label = ui.label('⏱ Code expires in: 05:00').classes('text-xs font-bold text-slate-600 mt-1')
+
+                # OTP Input Field
+                s3_otp_ref = ui.input('Enter 6-Digit OTP *', placeholder='Enter 6-digit OTP').classes('w-full mt-1')
+                s3_otp_ref.props('autocomplete=one-time-code maxlength=6 inputmode=numeric')
+
+                # Verification Status & Error Messages
+                s3_status = ui.label('').classes('text-xs font-bold mt-1')
+                s3_error = ui.label('').classes('text-xs font-bold mt-1 text-red-600')
                 s3_note = ui.label('').classes('text-xs text-slate-500 mt-1')
-                otp_request = {'in_flight': False}
 
-                def set_otp_positive(message: str) -> None:
-                    s3_status.text = f'✅ {message}'
-                    s3_status.classes(remove='text-red-600', add='text-green-700')
+                # Buttons row: Generate OTP / Resend OTP & Verify OTP
+                with ui.row().classes('w-full gap-2 mt-3 flex-wrap'):
+                    gen_otp_btn = ui.button('📲 Generate OTP', on_click=lambda: do_generate_otp()).props('unelevated').classes(
+                        'flex-1 min-w-[140px] bg-blue-700 hover:bg-blue-800 text-white font-bold rounded-xl py-2 text-sm'
+                    )
+                    resend_otp_btn = ui.button('🔄 Resend OTP', on_click=lambda: do_generate_otp()).props('outline').classes(
+                        'flex-1 min-w-[140px] text-blue-700 border-blue-400 hover:bg-blue-50 font-bold rounded-xl py-2 text-sm'
+                    )
+                    resend_otp_btn.set_visibility(False)
 
-                def set_otp_problem(message: str) -> None:
-                    s3_status.text = f'⚠ {message}'
-                    s3_status.classes(remove='text-green-700', add='text-red-600')
+                    verify_otp_btn = ui.button('Verify OTP', icon='check_circle', on_click=lambda: do_verify_otp()).props('unelevated').classes(
+                        'flex-1 min-w-[140px] bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl py-2 text-sm'
+                    )
 
-                def set_otp_note(message: str) -> None:
-                    s3_note.text = message
+                def update_countdown() -> None:
+                    """Update 5-minute countdown every second."""
+                    if state.get('s3_otp_verified'):
+                        s3_countdown_label.text = '✅ Verified'
+                        s3_countdown_label.classes(remove='text-red-600 text-slate-600', add='text-emerald-700 font-bold')
+                        return
+
+                    expires_ts = state.get('s3_expires_timestamp')
+                    if not expires_ts or not state.get('s3_otp_sent'):
+                        return
+
+                    diff = int(expires_ts - time.time())
+                    if diff > 0:
+                        mins = diff // 60
+                        secs = diff % 60
+                        s3_countdown_label.text = f'⏱ Code expires in: {mins:02d}:{secs:02d}'
+                        s3_countdown_label.classes(remove='text-red-600 text-emerald-700', add='text-slate-600 font-bold')
+                    else:
+                        s3_countdown_label.text = '⏱ OTP has expired. Please click "Resend OTP" to generate a new code.'
+                        s3_countdown_label.classes(remove='text-slate-600 text-emerald-700', add='text-red-600 font-bold')
 
                 def sync_otp_state() -> None:
-                    """Mirror the stored OTP session so a reload cannot lose step 3."""
+                    """Mirror the stored OTP session so a reload or navigation maintains state."""
                     clean_mobile, _ = normalize_mobile(s3_mobile_ref.value or state.get('s3_mobile', ''))
-                    if not clean_mobile or otp_request['in_flight']:
+                    if not clean_mobile:
                         return
                     session = get_otp_session_status(clean_mobile)
                     if session['verified']:
                         state['s3_otp_verified'] = True
-                        s3_demo_label.text = ''
-                        set_otp_note('')
-                        send_otp_button.enable()
-                        set_otp_positive('Mobile number verified. Continue to the photo step.')
-                        return
-
-                    state['s3_otp_verified'] = False
-                    if not session['has_session']:
-                        send_otp_button.enable()
-                        return
-                    if session['delivery_status'] == 'TEST_MODE':
-                        s3_demo_label.text = f'🧪 Development OTP: {TEST_MODE_OTP}'
-                    if session['can_resend_in'] > 0:
-                        send_otp_button.disable()
-                    else:
-                        send_otp_button.enable()
-                    set_otp_note(
-                        f"OTP active for {clean_mobile} — {session['attempts_remaining']} attempt(s) left. "
-                        + (f"New code available in {session['can_resend_in']}s."
-                           if session['can_resend_in'] else 'You can request a new code.')
-                    )
-
-                def do_send_otp() -> None:
-                    if otp_request['in_flight'] or not send_otp_button.enabled:
-                        return
-                    otp_request['in_flight'] = True
-                    try:
-                        ok, msg, demo_code = send_otp(s3_mobile_ref.value)
-                    finally:
-                        otp_request['in_flight'] = False
-                    if ok:
-                        state['s3_mobile'] = s3_mobile_ref.value
-                        state['s3_otp_sent'] = True
-                        state['s3_demo_otp'] = demo_code or ''
+                        s3_status.text = '✅ OTP verified successfully'
+                        s3_status.classes(remove='text-red-600', add='text-green-700 font-bold text-sm')
                         s3_error.text = ''
-                        set_otp_positive(msg)
-                        if demo_code:
-                            s3_demo_label.text = f'🧪 Development OTP: {demo_code}'
-                        send_otp_button.disable()
-                    else:
-                        set_otp_problem(msg)
-                    save_wizard_state()
+                        s3_note.text = 'Mobile number verified. Continue to the photo step.'
+                        return
 
-                send_otp_button = ui.button('📲 Send OTP', on_click=do_send_otp).props('unelevated').classes(
-                    'w-full bg-emerald-600 text-white font-bold rounded-xl py-2 text-sm mt-2'
-                )
+                    if state.get('s3_demo_otp') and state.get('s3_otp_sent'):
+                        otp_display_box.set_visibility(True)
+                        s3_otp_prompt_label.text = f"Your verification OTP is: {state['s3_demo_otp']}"
+                        s3_generated_code_label.text = state['s3_demo_otp']
+                        gen_otp_btn.set_visibility(False)
+                        resend_otp_btn.set_visibility(True)
 
-                s3_error = ui.label('').classes('text-red-600 text-xs font-semibold mt-1')
+                def do_generate_otp() -> None:
+                    mobile_val = s3_mobile_ref.value or state.get('s3_mobile', '')
+                    clean_mobile, err = normalize_mobile(mobile_val)
+                    if not clean_mobile:
+                        s3_error.text = f'⚠ {err}'
+                        s3_status.text = ''
+                        ui.notify(err, type='negative')
+                        return
 
-                def go_step3_next() -> None:
-                    ok, msg = verify_otp(s3_mobile_ref.value, s3_otp_ref.value)
+                    ok, msg, code = send_otp(clean_mobile)
                     if not ok:
                         s3_error.text = f'⚠ {msg}'
-                        sync_otp_state()
+                        s3_status.text = ''
+                        ui.notify(msg, type='negative')
                         return
-                    state['s3_mobile'] = s3_mobile_ref.value
+
+                    state['s3_mobile'] = clean_mobile
+                    state['s3_otp_sent'] = True
+                    state['s3_otp_verified'] = False
+                    state['s3_demo_otp'] = code
+                    state['s3_expires_timestamp'] = time.time() + 300.0
+
+                    s3_otp_ref.value = ''
+                    s3_error.text = ''
+                    s3_status.text = ''
+                    s3_note.text = 'Enter the 6-digit OTP displayed above and click "Verify OTP".'
+
+                    s3_otp_prompt_label.text = f"Your verification OTP is: {code}"
+                    s3_generated_code_label.text = code
+                    otp_display_box.set_visibility(True)
+
+                    gen_otp_btn.set_visibility(False)
+                    resend_otp_btn.set_visibility(True)
+
+                    ui.notify(f'Your verification OTP is: {code}', type='info', position='top')
+                    save_wizard_state()
+
+                def do_verify_otp() -> bool:
+                    mobile_val = s3_mobile_ref.value or state.get('s3_mobile', '')
+                    otp_val = (s3_otp_ref.value or '').strip()
+
+                    if not otp_val:
+                        s3_error.text = '⚠ Please enter the 6-digit OTP in the verification field.'
+                        s3_status.text = ''
+                        ui.notify('Please enter the 6-digit OTP', type='warning')
+                        return False
+
+                    ok, msg = verify_otp(mobile_val, otp_val)
+                    if not ok:
+                        s3_error.text = f'⚠ {msg}'
+                        s3_status.text = ''
+                        state['s3_otp_verified'] = False
+                        ui.notify(msg, type='negative')
+                        save_wizard_state()
+                        return False
+
+                    state['s3_mobile'] = mobile_val
                     state['s3_otp_verified'] = True
                     s3_error.text = ''
-                    ui.notify('OTP Verified ✓', type='positive')
+                    s3_status.text = '✅ OTP verified successfully'
+                    s3_status.classes(remove='text-red-600', add='text-green-700 font-bold text-sm')
+                    s3_note.text = 'Mobile number verified successfully. You can now proceed to the next registration step.'
+                    ui.notify('OTP verified successfully', type='positive')
                     save_wizard_state()
+                    return True
+
+                def go_step3_next() -> None:
+                    if not state.get('s3_otp_verified'):
+                        if s3_otp_ref.value:
+                            if not do_verify_otp():
+                                return
+                        else:
+                            s3_error.text = '⚠ Please enter and verify your OTP before proceeding.'
+                            ui.notify('Please verify your OTP first', type='warning')
+                            return
                     go_to_step(3)
 
-                with ui.row().classes('w-full gap-2 mt-4'):
+                with ui.row().classes('w-full gap-2 mt-5'):
                     ui.button('← Back', on_click=lambda: go_to_step(1), icon='arrow_back').props('flat').classes('text-slate-600')
-                    ui.button('Verify OTP & Continue →', on_click=go_step3_next, icon='arrow_forward').props(
+                    continue_step3_btn = ui.button('Continue to Next Step →', on_click=go_step3_next, icon='arrow_forward').props(
                         'unelevated'
                     ).classes('flex-1 bg-blue-800 text-white font-bold rounded-xl py-2 text-sm')
 
-                # Keeps the resend countdown, attempt counter and verified badge honest
-                # after a page reload or a Render cold start.
+                ui.timer(1.0, update_countdown)
                 ui.timer(2.0, sync_otp_state)
 
             step_panels.append(panel3)
@@ -637,58 +714,39 @@ async def create_register_page() -> None:
                     state['s5_address'] = address
                     state['s5_location_name'] = msg
 
-                    user = None
-                    application = None
                     try:
-                        user = register_user(
-                            name=state['s1_name'],
-                            email=state['s1_email'],
-                            phone=state['s3_mobile'],
-                            password=state['s1_password'],
-                            role='CITIZEN',
-                            district=district,
-                            address=address,
-                            gov_id=state['s2_gov_id'],
-                            status='PENDING_VERIFICATION',
-                        )
-
-                        application = create_citizen_application(
-                            citizen_id=user['id'],
+                        result = submit_citizen_registration(
                             full_name=state['s1_name'],
+                            email=state['s1_email'],
+                            password=state['s1_password'],
                             date_of_birth=state['s1_dob'],
                             gender=state['s1_gender'],
                             mobile=state['s3_mobile'],
-                            email=state['s1_email'],
+                            gov_id_type=state['s2_gov_id_type'],
+                            gov_id=state['s2_gov_id'],
                             address=address,
                             state=state_name,
                             district=district,
-                            username=user['email'],
-                            gov_id_type=state['s2_gov_id_type'],
-                            gov_id_masked=state['s2_masked'],
                             photo_bytes=state['s4_photo_bytes'],
                             photo_ext=state['s4_photo_ext'],
                             document_bytes=state['s2_doc_bytes'],
                             document_ext=state['s2_doc_ext'],
                             document_name=state['s2_doc_name'],
-                        )
-
-                        # Legacy onboarding record, kept aligned with the review status.
-                        record_citizen_verification_event(
-                            citizen_id=user['id'],
-                            gov_id_type=state['s2_gov_id_type'],
-                            gov_id_masked=state['s2_masked'],
-                            mobile=state['s3_mobile'],
-                            otp_verified=state['s3_otp_verified'],
-                            photo_verified=state['s4_photo_verified'],
-                            location_verified=ok,
                             location_data=loc_data,
-                            status='PENDING',
                         )
+                        user = result['user']
+                        application = result['application']
+
                         # No dashboard session is created until a Verification Officer approves.
                         set_current_user(None)
                         state['registered_user'] = user
                         nicegui_app.storage.user['pending_application_reference'] = application['reference']
                         nicegui_app.storage.user['pending_application_email'] = user['email']
+                        try:
+                            # Do not let a completed wizard resume for this tab.
+                            nicegui_app.storage.tab[WIZARD_STORAGE_KEY] = {}
+                        except RuntimeError:
+                            pass
                         s5_error.text = ''
                         ui.notify(
                             f'✅ Registration submitted as {application["reference"]}. '
@@ -697,12 +755,8 @@ async def create_register_page() -> None:
                         )
                         ui.navigate.to('/citizen/application-status')
                     except ValueError as e:
-                        if user:
-                            delete_unverified_citizen(user['id'])
                         s5_error.text = f'⚠ {e}'
                     except Exception as e:
-                        if user:
-                            delete_unverified_citizen(user['id'])
                         s5_error.text = f'⚠ Registration error: {e}'
                     finally:
                         state['submitting'] = False

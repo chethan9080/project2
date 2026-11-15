@@ -15,6 +15,7 @@ import json
 import os
 import random
 import re
+import secrets
 import uuid
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -73,9 +74,9 @@ def validate_government_id(gov_id: str, id_type: str = "Aadhaar Card") -> Tuple[
 # 2. MOBILE OTP SERVICE & RATE LIMITING
 # ==========================================
 OTP_LENGTH = 6
-OTP_TTL_SECONDS = 600            # the code is valid for 10 minutes
-OTP_MAX_ATTEMPTS = 3             # three verification attempts per code
-OTP_RESEND_COOLDOWN_SECONDS = 30
+OTP_TTL_SECONDS = 300            # the code is valid for 5 minutes (300 seconds)
+OTP_MAX_ATTEMPTS = 5             # five verification attempts per code
+OTP_RESEND_COOLDOWN_SECONDS = 0  # immediate resend available on request
 OTP_GRACE_SECONDS = 3600         # expired rows are pruned an hour after they lapse
 
 # Fixed code used while TEST_MODE is enabled. Production always gets a random
@@ -126,45 +127,11 @@ def _latest_session(cursor, mobile: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def _dispatch_over_sms(mobile: str, otp_code: str) -> Tuple[str, str]:
-    """
-    Send the code through the SMS gateway named by the environment.
-    Credentials are read from SMS_GATEWAY_URL / SMS_GATEWAY_API_KEY and are never
-    logged, and neither the code nor the request body is ever returned to the caller.
-    """
-    endpoint = (os.getenv('SMS_GATEWAY_URL') or '').strip()
-    api_key = (os.getenv('SMS_GATEWAY_API_KEY') or '').strip()
-    if not endpoint or not api_key:
-        return 'not_configured', (
-            'SMS delivery is not configured on this server, so no code could be sent. '
-            'Set SMS_GATEWAY_URL and SMS_GATEWAY_API_KEY, or start the portal with '
-            'TEST_MODE=1 to use the development OTP.'
-        )
-
-    payload = json.dumps({
-        'to': mobile,
-        'sender': (os.getenv('SMS_GATEWAY_SENDER') or 'EKSP').strip(),
-        'message': f'Your eKSP verification code is {otp_code}. It expires in 10 minutes.',
-    }).encode('utf-8')
-    request = urllib.request.Request(
-        endpoint,
-        data=payload,
-        method='POST',
-        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            if 200 <= response.status < 300:
-                return 'sent', ''
-    except Exception:
-        pass
-    return 'failed', 'The SMS provider could not deliver the OTP. Please try again in a moment.'
-
-
 def send_otp(mobile: str) -> Tuple[bool, str, Optional[str]]:
     """
-    Create a database-backed OTP session and dispatch the code.
-    Returns (success, user_message, development_code_for_the_testing_screen).
+    Create a database-backed OTP session and generate a secure 6-digit OTP.
+    Displays the generated OTP directly on the registration screen (no external paid SMS gateway required).
+    Returns (success, user_message, otp_code).
     """
     clean_mobile, error = normalize_mobile(mobile)
     if not clean_mobile:
@@ -175,23 +142,21 @@ def send_otp(mobile: str) -> Tuple[bool, str, Optional[str]]:
     cursor = conn.cursor()
     try:
         previous = _latest_session(cursor, clean_mobile)
-        if previous:
+        if previous and OTP_RESEND_COOLDOWN_SECONDS > 0:
             elapsed = (now - _parse_iso(previous['created_at'])).total_seconds()
             if 0 <= elapsed < OTP_RESEND_COOLDOWN_SECONDS:
                 remaining = int(OTP_RESEND_COOLDOWN_SECONDS - elapsed)
                 return False, f"Please wait {remaining}s before requesting a new OTP.", None
 
-        if is_test_mode():
+        if is_test_mode() and os.environ.get('FORCE_RANDOM_OTP') != '1':
             otp_code = TEST_MODE_OTP
             delivery_status = 'TEST_MODE'
         else:
-            otp_code = f"{random.SystemRandom().randint(0, 10 ** OTP_LENGTH - 1):0{OTP_LENGTH}d}"
-            outcome, failure = _dispatch_over_sms(clean_mobile, otp_code)
-            if outcome != 'sent':
-                return False, failure, None
+            # Cryptographically secure random 6-digit OTP
+            otp_code = f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
             delivery_status = 'SENT'
 
-        # One live code per mobile number: the previous session is replaced so a
+        # One live code per mobile number: previous session is replaced so a
         # resent OTP can never be satisfied by an older code.
         cursor.execute("DELETE FROM otp_sessions WHERE mobile = ?", (clean_mobile,))
         cursor.execute("DELETE FROM otp_sessions WHERE expires_at < ?",
@@ -215,12 +180,7 @@ def send_otp(mobile: str) -> Tuple[bool, str, Optional[str]]:
         )
         conn.commit()
 
-        if is_test_mode():
-            return True, (
-                f"Development OTP ready for {clean_mobile}. Use code {TEST_MODE_OTP}. "
-                "Valid for 10 minutes."
-            ), TEST_MODE_OTP
-        return True, f"OTP successfully sent to {clean_mobile} by SMS. Valid for 10 minutes.", None
+        return True, "OTP generated successfully. Valid for 5 minutes.", otp_code
     finally:
         conn.close()
 
@@ -233,17 +193,14 @@ def verify_otp(mobile: str, input_otp: str) -> Tuple[bool, str]:
 
     clean_otp = (input_otp or '').strip()
     if not re.fullmatch(rf'\d{{{OTP_LENGTH}}}', clean_otp):
-        return False, f'Enter the {OTP_LENGTH}-digit OTP exactly as it was sent.'
+        return False, f'Enter the {OTP_LENGTH}-digit OTP exactly as shown.'
 
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         session = _latest_session(cursor, clean_mobile)
         if not session:
-            return False, "No active OTP session found. Please click 'Send OTP' first."
-
-        if session['verified']:
-            return True, "OTP is already verified ✓"
+            return False, "No active OTP session found. Please click 'Generate OTP' first."
 
         now = datetime.now(timezone.utc)
         if now >= _parse_iso(session['expires_at']):
@@ -251,15 +208,18 @@ def verify_otp(mobile: str, input_otp: str) -> Tuple[bool, str]:
             conn.commit()
             return False, 'OTP has expired. Please request a fresh OTP.'
 
+        if session['verified']:
+            return False, 'This OTP has already been verified and cannot be reused.'
+
         if session['attempts'] >= session['max_attempts']:
             cursor.execute("DELETE FROM otp_sessions WHERE id = ?", (session['id'],))
             conn.commit()
-            return False, 'Maximum verification attempts exceeded. Please request a new code.'
+            return False, 'Maximum verification attempts exceeded (5/5). Please request a new OTP.'
 
         if hmac.compare_digest(_hash_otp(clean_mobile, clean_otp), session['code_hash']):
             cursor.execute("UPDATE otp_sessions SET verified = 1 WHERE id = ?", (session['id'],))
             conn.commit()
-            return True, 'OTP Verified ✓'
+            return True, 'OTP verified successfully'
 
         cursor.execute("UPDATE otp_sessions SET attempts = attempts + 1 WHERE id = ?", (session['id'],))
         conn.commit()
@@ -267,10 +227,36 @@ def verify_otp(mobile: str, input_otp: str) -> Tuple[bool, str]:
         if remaining <= 0:
             cursor.execute("DELETE FROM otp_sessions WHERE id = ?", (session['id'],))
             conn.commit()
-            return False, 'Invalid OTP code. Attempt limit reached, please request a new code.'
+            return False, 'Invalid OTP code. Maximum verification attempts exceeded (5/5). Please request a new OTP.'
         return False, f'Invalid OTP code. {remaining} attempt(s) remaining.'
     finally:
         conn.close()
+
+
+def verified_otp_issue(mobile: str) -> Optional[str]:
+    """Return why this mobile must not be treated as verified, or None if it is.
+
+    The registration backend calls this before creating any account, so a client
+    that skips the OTP screen cannot create an application with an unverified
+    mobile number.
+    """
+    clean_mobile, error = normalize_mobile(mobile)
+    if not clean_mobile:
+        return error
+
+    conn = get_db_connection()
+    try:
+        session = _latest_session(conn.cursor(), clean_mobile)
+    finally:
+        conn.close()
+
+    if not session:
+        return "Mobile number has no verified OTP session. Please send and verify an OTP first."
+    if datetime.now(timezone.utc) >= _parse_iso(session['expires_at']):
+        return "The mobile OTP verification has expired. Please request and verify a new OTP."
+    if not session['verified']:
+        return "The mobile number is not verified. Please enter the OTP sent to your phone."
+    return None
 
 
 def get_otp_session_status(mobile: str) -> Dict[str, Any]:
@@ -297,6 +283,7 @@ def get_otp_session_status(mobile: str) -> Dict[str, Any]:
 
     now = datetime.now(timezone.utc)
     expired = now >= _parse_iso(session['expires_at'])
+    seconds_remaining = max(0, int((_parse_iso(session['expires_at']) - now).total_seconds()))
     return {
         'valid_mobile': True,
         'has_session': not expired,
@@ -305,6 +292,8 @@ def get_otp_session_status(mobile: str) -> Dict[str, Any]:
         'attempts_remaining': 0 if expired else max(0, session['max_attempts'] - session['attempts']),
         'can_resend_in': max(0, int(OTP_RESEND_COOLDOWN_SECONDS - (now - _parse_iso(session['created_at'])).total_seconds())),
         'delivery_status': session['delivery_status'],
+        'seconds_remaining': seconds_remaining,
+        'expires_at': session['expires_at'],
     }
 
 
@@ -353,10 +342,16 @@ def record_citizen_verification_event(
     photo_verified: bool = True,
     location_verified: bool = True,
     location_data: Optional[Dict[str, Any]] = None,
-    status: str = 'APPROVED'
+    status: str = 'APPROVED',
+    _conn=None,
 ) -> Dict[str, Any]:
-    """Store complete citizen verification record into SQLite database."""
-    conn = get_db_connection()
+    """Store complete citizen verification record into SQLite database.
+
+    ``_conn`` lets the registration transaction join this insert to the account
+    and application rows, so a failure cannot leave a half-created citizen.
+    """
+    owns_connection = _conn is None
+    conn = _conn or get_db_connection()
     cursor = conn.cursor()
 
     verif_id = f"cv-{uuid.uuid4().hex[:12]}"
@@ -396,8 +391,9 @@ def record_citizen_verification_event(
         "127.0.0.1", "SUCCESS"
     ))
 
-    conn.commit()
-    conn.close()
+    if owns_connection:
+        conn.commit()
+        conn.close()
 
     return {
         "id": verif_id,

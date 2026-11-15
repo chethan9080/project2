@@ -720,11 +720,36 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
         WHERE f.id = ?
     """, (fir_id,))
     row = cursor.fetchone()
-    conn.close()
-    
     if not row:
+        conn.close()
         return {}
     fir = dict(row)
+
+    # Preparation/registration time for the verification stage. firs.updated_at moves
+    # on every later edit or reassignment, so it cannot stand in for this milestone.
+    cursor.execute("""
+        SELECT MIN(timestamp) AS verified_at FROM officer_activity_logs
+        WHERE fir_id = ? AND action_type IN ('FIR_VERIFIED', 'FIR_REGISTERED')
+    """, (fir_id,))
+    log_row = cursor.fetchone()
+    verification_at = (dict(log_row).get('verified_at') if log_row else None) or fir.get('created_at')
+
+    # A reassignment is authoritative in officer_assignments. Reading it from there
+    # keeps the stage machine untouched while still letting the timeline show the
+    # current assignment time and a public-safe handover message.
+    cursor.execute("""
+        SELECT assigned_at FROM officer_assignments
+        WHERE fir_id = ? AND status = 'ACTIVE'
+        ORDER BY assigned_at DESC LIMIT 1
+    """, (fir_id,))
+    active_row = cursor.fetchone()
+    active_assigned_at = dict(active_row).get('assigned_at') if active_row else None
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM officer_assignments WHERE fir_id = ? AND status = 'REASSIGNED'",
+        (fir_id,),
+    )
+    reassigned_count = dict(cursor.fetchone() or {}).get('n', 0) or 0
+    conn.close()
 
     # Live tracking carries internal remarks, stage timing and the investigating officer's
     # identity, so the same assignment/ownership rule as every other case read applies here.
@@ -839,7 +864,7 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
             if is_verified or idx <= cur_idx or 'FIR_VERIFIED' in history_by_stage:
                 status = 'COMPLETED'
                 color = 'green'
-                timestamp_str = stage_hist.get('timestamp') if stage_hist else fir.get('updated_at', fir.get('created_at'))
+                timestamp_str = stage_hist.get('timestamp') if stage_hist else verification_at
                 desc = "FIR verified by Authorized Verification Officer. Legal authenticity confirmed."
             elif idx == cur_idx:
                 status = 'CURRENT'
@@ -855,6 +880,8 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
                 status = 'COMPLETED'
                 color = 'green'
                 timestamp_str = stage_hist.get('timestamp') if stage_hist else fir.get('updated_at', fir.get('created_at'))
+                if reassigned_count and active_assigned_at:
+                    timestamp_str = active_assigned_at
                 officer_info = " ".join(part for part in (
                     fir.get('officer_rank') or 'Officer',
                     fir.get('officer_name') or 'Investigating Officer',
@@ -864,6 +891,14 @@ def get_fir_complete_tracking(fir_id: str, actor_user: Optional[Dict[str, Any]] 
                     "Investigating officer assigned to this case at "
                     f"{fir.get('police_station') or 'the jurisdiction station'}."
                 )
+                # Citizens see a handover message naming the current officer only;
+                # the reason and internal remarks stay in the officer-visible audit trail.
+                if is_public_view and reassigned_count and fir.get('officer_name'):
+                    desc = (
+                        f"Your case has been reassigned to "
+                        f"{fir.get('officer_rank') or 'Police Officer'} {fir.get('officer_name')}. "
+                        'The investigation continues under the same FIR number and all case history is preserved.'
+                    )
             elif idx == cur_idx:
                 status = 'CURRENT'
                 color = 'blue'

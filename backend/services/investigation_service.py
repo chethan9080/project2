@@ -33,10 +33,13 @@ from backend.services.complaint_evidence_service import (
     validate_upload,
 )
 
+from backend.services.config_service import get_secure_uploads_root
+
 CONFIG_PATH = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..', 'config', 'officer_credits.json'
 ))
-EVIDENCE_ROOT = os.path.abspath(os.path.join(
+EVIDENCE_ROOT = os.path.join(get_secure_uploads_root(), 'investigation')
+LOCAL_FALLBACK_EVIDENCE_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..', 'data', 'secure_uploads', 'investigation'
 ))
 
@@ -614,8 +617,13 @@ def get_evidence_file(entry_id: str, user: Dict[str, Any]) -> Optional[Tuple[byt
         raise PermissionError('Internal evidence is restricted.')
     folder = _fir_evidence_dir(entry['fir_id'])
     path = os.path.abspath(os.path.join(folder, os.path.basename(entry['stored_name'])))
-    if not path.startswith(folder + os.sep) or not os.path.isfile(path):
-        return None
+    if not (path.startswith(folder + os.sep) and os.path.isfile(path)):
+        fallback_folder = os.path.join(LOCAL_FALLBACK_EVIDENCE_ROOT, entry['fir_id'])
+        fallback_path = os.path.abspath(os.path.join(fallback_folder, os.path.basename(entry['stored_name'])))
+        if fallback_path.startswith(fallback_folder + os.sep) and os.path.isfile(fallback_path):
+            path = fallback_path
+        else:
+            return None
     with open(path, 'rb') as handle:
         return handle.read(), entry['file_name'], entry['content_type'] or 'application/octet-stream'
 

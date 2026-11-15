@@ -6,7 +6,9 @@ Handles FIR integrity monitoring, version comparison, audit logs, and officer ma
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from backend.services.db import get_db_connection
+from backend.services.crypto_service import calculate_sha256, canonical_json
 import json
+import uuid
 
 
 def get_integrity_dashboard_stats() -> Dict[str, Any]:
@@ -527,143 +529,445 @@ def get_fir_complete_timeline(fir_id: str) -> Dict[str, Any]:
     }
 
 
+REASSIGNMENT_REASONS = (
+    'Suspected tampering',
+    'Unauthorized modification',
+    'Security concern',
+    'Administrative reassignment',
+    'Investigation continuity',
+)
+
+
+def _now_iso() -> str:
+    # Naive local timestamp, matching officer_assignments rows written elsewhere.
+    return datetime.now().isoformat()
+
+
+def _human_time(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value).strftime('%d %b %Y %H:%M IST')
+    except Exception:
+        return value
+
+
+def _insert_notification(
+    cursor,
+    *,
+    user_id: str,
+    fir_id: Optional[str],
+    complaint_id: Optional[str],
+    event_key: str,
+    title: str,
+    message: str,
+    notification_type: str = 'OFFICER_REASSIGNMENT',
+    severity: str = 'INFO',
+) -> Optional[Dict[str, Any]]:
+    """Queue one persistent notification inside the caller's transaction.
+
+    The ``event_key`` makes the delivery idempotent: replaying the same
+    reassignment never creates a second alert for the same user.
+    """
+    cursor.execute(
+        "SELECT 1 FROM notifications WHERE user_id = ? AND event_id = ? LIMIT 1",
+        (user_id, event_key),
+    )
+    if cursor.fetchone():
+        return None
+    notif_id = f"ntf-{uuid.uuid4().hex[:12]}"
+    now = _now_iso()
+    cursor.execute("""
+        INSERT INTO notifications (
+            id, user_id, fir_id, complaint_id, event_id, type, title, message,
+            is_read, severity, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    """, (
+        notif_id, user_id, fir_id or None, complaint_id or None, event_key,
+        notification_type, title, message, severity, now,
+    ))
+    return {
+        'id': notif_id,
+        'user_id': user_id,
+        'fir_id': fir_id,
+        'complaint_id': complaint_id,
+        'title': title,
+        'message': message,
+        'type': notification_type,
+        'severity': severity,
+        'is_read': 0,
+        'created_at': now,
+    }
+
+
 def reassign_officer(
     fir_id: str,
     new_officer_id: str,
     authorized_officer_id: str,
-    reason: str
+    reason: str,
+    remarks: str = ''
 ) -> Dict[str, Any]:
+    """Change the investigating officer of an existing FIR atomically.
+
+    The FIR number, document, evidence, versions, hashes, messages and every
+    historical record stay untouched. Only the active assignment changes; the
+    previous assignment row is closed with its revocation timestamp and the new
+    assignment is created with the reason/remarks that justified it.
+
+    Everything below - assignment, FIR row, complaint linkage, audit event and
+    the notifications for every role - runs in one SQLite transaction, so a
+    failure cannot leave a half-reassigned case behind.
     """
-    Reassign an officer to an FIR (Authorized Officers only).
-    Creates audit trail for the reassignment.
-    
-    Args:
-        fir_id: FIR identifier
-        new_officer_id: New officer's user ID
-        authorized_officer_id: Authorized officer making the change
-        reason: Reason for reassignment
-    
-    Returns:
-        Result of reassignment operation
-    """
+    reason = (reason or '').strip()
+    remarks = (remarks or '').strip()
+    if len(reason) < 10:
+        raise ValueError('Select a reassignment reason (at least 10 characters).')
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Get current assignment
-    cursor.execute("""
-        SELECT 
-            officer_id,
-            u.name,
-            u.badge_number,
-            u.role
-        FROM officer_assignments oa
-        JOIN users u ON oa.officer_id = u.id
-        WHERE oa.fir_id = ? AND oa.status = 'ACTIVE'
-    """, (fir_id,))
-    
-    current_assignment = cursor.fetchone()
-    old_officer_id = current_assignment[0] if current_assignment else None
-    old_officer_name = current_assignment[1] if current_assignment else "None"
-    
-    # Get new officer details
-    cursor.execute("""
-        SELECT name, badge_number, role
-        FROM users
-        WHERE id = ?
-    """, (new_officer_id,))
-    
-    new_officer = cursor.fetchone()
-    if not new_officer:
-        conn.close()
-        return {'success': False, 'error': 'New officer not found'}
-    
-    new_officer_name = new_officer[0]
-    new_officer_badge = new_officer[1]
-    
-    # Get authorized officer details
-    cursor.execute("""
-        SELECT name, role, badge_number
-        FROM users
-        WHERE id = ?
-    """, (authorized_officer_id,))
-    
-    auth_officer = cursor.fetchone()
-    auth_officer_name = auth_officer[0] if auth_officer else "Unknown"
-    auth_officer_role = auth_officer[1] if auth_officer else "UNKNOWN"
-    
-    now = datetime.now().isoformat()
-    
-    # Mark old assignment as REASSIGNED
-    if old_officer_id:
+    queued_notifications: List[Dict[str, Any]] = []
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+
+        cursor.execute("""
+            SELECT f.*, cu.name AS citizen_name, cu.phone AS citizen_phone,
+                   c.reference AS complaint_reference
+            FROM firs f
+            LEFT JOIN users cu ON f.citizen_id = cu.id
+            LEFT JOIN complaints c ON f.complaint_id = c.id
+            WHERE f.id = ?
+        """, (fir_id,))
+        fir_row = cursor.fetchone()
+        if not fir_row:
+            raise ValueError('FIR not found.')
+        fir = dict(fir_row)
+
+        cursor.execute(
+            "SELECT * FROM users WHERE id = ? AND role = 'OFFICER' AND status = 'ACTIVE'",
+            (new_officer_id,),
+        )
+        new_officer_row = cursor.fetchone()
+        if not new_officer_row:
+            raise ValueError('Select an active police officer for this FIR.')
+        new_officer = dict(new_officer_row)
+
+        cursor.execute(
+            "SELECT id, name, role, badge_number FROM users WHERE id = ?",
+            (authorized_officer_id,),
+        )
+        actor_row = cursor.fetchone()
+        if not actor_row:
+            raise ValueError('Authorized Officer account not found.')
+        actor = dict(actor_row)
+        if actor.get('role') not in ('ADMIN', 'AUTHORIZED_OFFICER'):
+            raise PermissionError('Only an Authorized Officer may change the assigned officer.')
+
+        cursor.execute("""
+            SELECT oa.*, u.name AS officer_name, u.badge_number AS officer_badge,
+                   u.rank AS officer_rank
+            FROM officer_assignments oa
+            JOIN users u ON oa.officer_id = u.id
+            WHERE oa.fir_id = ? AND oa.status = 'ACTIVE'
+            ORDER BY oa.assigned_at DESC LIMIT 1
+        """, (fir_id,))
+        current_row = cursor.fetchone()
+        current_assignment = dict(current_row) if current_row else None
+
+        old_officer_id = (
+            current_assignment['officer_id'] if current_assignment
+            else fir.get('assigned_officer_id')
+        )
+        old_officer_name = (
+            current_assignment['officer_name'] if current_assignment
+            else 'Not assigned'
+        )
+        old_officer_badge = current_assignment['officer_badge'] if current_assignment else None
+
+        now = _now_iso()
+
+        # Idempotent replay: the requested officer already owns the case.
+        if old_officer_id == new_officer_id:
+            conn.rollback()
+            return {
+                'success': True,
+                'already_assigned': True,
+                'message': f"{new_officer['name']} is already the active investigating officer.",
+                'previous_officer': {
+                    'id': old_officer_id,
+                    'name': old_officer_name,
+                    'badge': old_officer_badge,
+                },
+                'new_officer': {
+                    'id': new_officer_id,
+                    'name': new_officer['name'],
+                    'badge': new_officer.get('badge_number'),
+                },
+                'authorized_by': {
+                    'id': authorized_officer_id,
+                    'name': actor['name'],
+                    'role': actor['role'],
+                },
+                'timestamp': now,
+                'reason': reason,
+                'remarks': remarks,
+                'fir_number': fir.get('fir_number'),
+                'citizen': {'id': fir.get('citizen_id'), 'name': fir.get('citizen_name')},
+                'complaint_reference': fir.get('complaint_reference'),
+                'notifications': [],
+            }
+
+        # 1. Close the previous active assignment and record the exact revocation.
         cursor.execute("""
             UPDATE officer_assignments
-            SET status = 'REASSIGNED'
+            SET status = 'REASSIGNED',
+                revoked_at = ?,
+                reason = ?,
+                remarks = ?
             WHERE fir_id = ? AND status = 'ACTIVE'
+        """, (now, reason, remarks, fir_id))
+
+        # 2. Create the new active assignment (fresh UUID - no timestamp collisions).
+        assignment_id = f"asg-{uuid.uuid4().hex[:12]}"
+        cursor.execute("""
+            INSERT INTO officer_assignments (
+                id, fir_id, officer_id, assigned_by, assigned_at, status, reason, remarks
+            ) VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
+        """, (assignment_id, fir_id, new_officer_id, authorized_officer_id, now, reason, remarks))
+
+        # 3. Point the FIR (and the originating complaint) at the new officer.
+        cursor.execute(
+            "UPDATE firs SET assigned_officer_id = ?, updated_at = ? WHERE id = ?",
+            (new_officer_id, now, fir_id),
+        )
+        if fir.get('complaint_id'):
+            cursor.execute("""
+                UPDATE complaints
+                SET assigned_officer_id = ?, assigned_officer_name = ?,
+                    assigned_at = ?, updated_at = ?
+                WHERE id = ?
+            """, (
+                new_officer_id, new_officer['name'], now, now, fir['complaint_id'],
+            ))
+
+        # 4. Immutable audit event. The FIR content hash is unchanged by a
+        #    reassignment, so current_hash remains the trusted canonical proof.
+        cursor.execute("""
+            SELECT id, version_number, current_hash, previous_hash
+            FROM fir_versions WHERE fir_id = ?
+            ORDER BY version_number DESC LIMIT 1
         """, (fir_id,))
-    
-    # Create new assignment
-    assignment_id = f"ASSIGN-{datetime.now().strftime('%Y%m%d%H%M%S')}-{fir_id[-4:]}"
-    cursor.execute("""
-        INSERT INTO officer_assignments
-        (id, fir_id, officer_id, assigned_by, assigned_at, status)
-        VALUES (?, ?, ?, ?, ?, 'ACTIVE')
-    """, (assignment_id, fir_id, new_officer_id, authorized_officer_id, now))
-    
-    # Update FIR assigned_officer_id
-    cursor.execute("""
-        UPDATE firs
-        SET assigned_officer_id = ?, updated_at = ?
-        WHERE id = ?
-    """, (new_officer_id, now, fir_id))
-    
-    # Create change event for audit trail
-    event_id = f"EVT-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-    cursor.execute("""
-        INSERT INTO fir_change_events
-        (id, fir_id, version_id, actor_id, actor_name, actor_role, 
-         event_type, changed_fields_json, old_values_json, new_values_json,
-         reason, timestamp, blockchain_tx_id, event_hash, actor_badge)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        event_id,
-        fir_id,
-        'REASSIGNMENT',
-        authorized_officer_id,
-        auth_officer_name,
-        auth_officer_role,
-        'OFFICER_REASSIGNMENT',
-        json.dumps(['assigned_officer_id']),
-        json.dumps({'assigned_officer': old_officer_name}),
-        json.dumps({'assigned_officer': new_officer_name}),
-        reason,
-        now,
-        f"TX-REASSIGN-{event_id}",
-        f"hash-{event_id}",
-        auth_officer[2] if auth_officer else None
-    ))
-    
-    conn.commit()
-    conn.close()
-    
+        version_row = cursor.fetchone()
+        version_id = version_row['id'] if version_row else f"reassign-{fir_id}"
+        version_number = int(version_row['version_number']) if version_row else int(fir.get('current_version') or 1)
+        canonical_hash = (
+            version_row['current_hash'] if version_row and version_row['current_hash']
+            else fir.get('current_hash') or ''
+        )
+        previous_hash = canonical_hash
+
+        event_id = f"evt-{uuid.uuid4().hex[:12]}"
+        event_number = f"REAS-{uuid.uuid4().hex[:10].upper()}"
+        old_record = f"{old_officer_name} ({old_officer_badge or 'N/A'})"
+        new_record = f"{new_officer['name']} ({new_officer.get('badge_number') or 'N/A'})"
+        event_reason = reason + (f" - {remarks}" if remarks else '')
+        event_hash = calculate_sha256(canonical_json({
+            'event': 'OFFICER_REASSIGNMENT',
+            'fir_id': fir_id,
+            'previous_officer_id': old_officer_id,
+            'new_officer_id': new_officer_id,
+            'actor_id': authorized_officer_id,
+            'reason': event_reason,
+            'timestamp': now,
+        }))
+
+        tx_id = f"AUDIT-{event_id}"
+        cursor.execute("""
+            INSERT INTO fir_change_events (
+                id, event_number, fir_id, version_id, previous_version, new_version,
+                actor_id, actor_name, actor_badge, actor_role, event_type,
+                changed_fields_json, old_values_json, new_values_json, reason,
+                timestamp, timezone, previous_hash, new_hash, blockchain_tx_id,
+                blockchain_status, event_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OFFICER_REASSIGNMENT',
+                      ?, ?, ?, ?, ?, 'UTC', ?, ?, ?, 'AUDIT_ONLY', ?)
+        """, (
+            event_id, event_number, fir_id, version_id, version_number, version_number,
+            authorized_officer_id, actor['name'], actor.get('badge_number'), actor['role'],
+            json.dumps(['assigned_officer_id']),
+            json.dumps({'assigned_officer_id': old_record}),
+            json.dumps({
+                'assigned_officer_id': new_record,
+                'reassignment_reason': reason,
+                'remarks': remarks,
+            }),
+            event_reason, now, previous_hash, canonical_hash, tx_id, event_hash,
+        ))
+
+        # 5. Notifications for every role, queued in the same transaction.
+        complaint_reference = fir.get('complaint_reference') or 'Not recorded'
+        display_time = _human_time(now)
+        new_officer_notification = _insert_notification(
+            cursor,
+            user_id=new_officer_id,
+            fir_id=fir_id,
+            complaint_id=fir.get('complaint_id'),
+            event_key=f'reassign-new-officer-{event_id}',
+            title='New FIR Assigned to You',
+            message=(
+                'An existing FIR has been reassigned to you by the Authorized Officer. '
+                'You are now responsible for continuing this investigation. Please review the FIR '
+                'document, supporting evidence and previous investigation history.\n\n'
+                f"FIR Number: {fir.get('fir_number')}\n"
+                f"Citizen: {fir.get('citizen_name') or 'Citizen'}\n"
+                f"Complaint Reference: {complaint_reference}\n"
+                f"Assigned: {display_time}\n"
+                f"Open case: /police/fir/{fir_id}"
+            ),
+            severity='INFO',
+        )
+        if new_officer_notification:
+            queued_notifications.append(new_officer_notification)
+
+        citizen_notification = _insert_notification(
+            cursor,
+            user_id=fir.get('citizen_id'),
+            fir_id=fir_id,
+            complaint_id=fir.get('complaint_id'),
+            event_key=f'reassign-citizen-{event_id}',
+            title='Your FIR has been assigned to a new Police Officer.',
+            message=(
+                f"Your FIR {fir.get('fir_number')} has been reassigned to Officer "
+                f"{new_officer['name']}. The new officer will continue handling your investigation. "
+                'Your existing FIR details and case history have been preserved. You can communicate '
+                'with the newly assigned officer through your Citizen Dashboard.\n\n'
+                f"FIR Number: {fir.get('fir_number')}\n"
+                f"Reassigned: {display_time}\n"
+                f"Track your case: /citizen/fir/{fir_id}/track\n"
+                f"Chat with your officer: /citizen/chat/{fir_id}"
+            ),
+            severity='SUCCESS',
+        )
+        if citizen_notification:
+            queued_notifications.append(citizen_notification)
+
+        if old_officer_id and old_officer_id != new_officer_id:
+            previous_notification = _insert_notification(
+                cursor,
+                user_id=old_officer_id,
+                fir_id=None,
+                complaint_id=None,
+                event_key=f'reassign-previous-officer-{event_id}',
+                title='FIR Reassigned to Another Officer',
+                message=(
+                    f"FIR {fir.get('fir_number')} has been reassigned by the Authorized Officer. "
+                    f"Your active access to this case ended on {display_time}. Your prior notes, "
+                    'evidence and messages remain preserved in the case history.'
+                ),
+                severity='WARNING',
+            )
+            if previous_notification:
+                queued_notifications.append(previous_notification)
+
+        actor_notification = _insert_notification(
+            cursor,
+            user_id=authorized_officer_id,
+            fir_id=fir_id,
+            complaint_id=fir.get('complaint_id'),
+            event_key=f'reassign-actor-{event_id}',
+            title='Officer Reassignment Recorded',
+            message=(
+                f"FIR {fir.get('fir_number')}: {old_officer_name} was replaced by "
+                f"{new_officer['name']} ({new_officer.get('badge_number') or 'N/A'}). "
+                f"Reason: {reason}. Recorded {display_time}.\n"
+                f"Open case record: /admin/fir-cases/{fir_id}/full"
+            ),
+            notification_type='AUDIT_ALERT',
+            severity='INFO',
+        )
+        if actor_notification:
+            queued_notifications.append(actor_notification)
+
+        cursor.execute(
+            "SELECT id FROM users WHERE role = 'VERIFICATION_OFFICER' AND status = 'ACTIVE'"
+        )
+        for row in cursor.fetchall():
+            verification_notification = _insert_notification(
+                cursor,
+                user_id=row['id'],
+                fir_id=fir_id,
+                complaint_id=fir.get('complaint_id'),
+                event_key=f"reassign-verification-{event_id}-{row['id']}",
+                title='Investigating Officer Reassigned',
+                message=(
+                    f"FIR {fir.get('fir_number')} is now handled by {new_officer['name']} "
+                    f"({new_officer.get('badge_number') or 'N/A'}), replacing {old_officer_name}. "
+                    f"Reason: {reason}. Recorded {display_time}."
+                ),
+                notification_type='OFFICER_REASSIGNMENT',
+                severity='INFO',
+            )
+            if verification_notification:
+                queued_notifications.append(verification_notification)
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    # 6. Realtime push happens only after the transaction is durable.
+    try:
+        from backend.services.realtime_events import publish
+        for notification in queued_notifications:
+            publish({
+                'type': 'NOTIFICATION_CREATED',
+                'user_id': notification['user_id'],
+                'notification': notification,
+            })
+        publish({
+            'type': 'FIR_UPDATED',
+            'event': 'OFFICER_REASSIGNED',
+            'fir_id': fir_id,
+            'fir_number': fir.get('fir_number'),
+            'citizen_id': fir.get('citizen_id'),
+            'officer_id': new_officer_id,
+            'previous_officer_id': old_officer_id,
+        })
+    except Exception:
+        pass
+
     return {
         'success': True,
-        'message': f'Officer reassigned from {old_officer_name} to {new_officer_name}',
+        'already_assigned': False,
+        'message': f"Officer reassigned from {old_officer_name} to {new_officer['name']}.",
         'previous_officer': {
             'id': old_officer_id,
-            'name': old_officer_name
+            'name': old_officer_name,
+            'badge': old_officer_badge,
+            'revoked_at': now,
         },
         'new_officer': {
             'id': new_officer_id,
-            'name': new_officer_name,
-            'badge': new_officer_badge
+            'name': new_officer['name'],
+            'badge': new_officer.get('badge_number'),
+            'rank': new_officer.get('rank'),
+            'station': new_officer.get('station'),
         },
         'authorized_by': {
             'id': authorized_officer_id,
-            'name': auth_officer_name,
-            'role': auth_officer_role
+            'name': actor['name'],
+            'role': actor['role'],
         },
         'timestamp': now,
         'reason': reason,
+        'remarks': remarks,
+        'fir_number': fir.get('fir_number'),
+        'citizen': {'id': fir.get('citizen_id'), 'name': fir.get('citizen_name')},
+        'complaint_reference': fir.get('complaint_reference'),
         'assignment_id': assignment_id,
-        'event_id': event_id
+        'event_id': event_id,
+        'event_number': event_number,
+        'notifications': [
+            {'user_id': n['user_id'], 'title': n['title'], 'id': n['id']}
+            for n in queued_notifications
+        ],
     }

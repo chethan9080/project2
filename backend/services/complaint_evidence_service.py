@@ -14,11 +14,12 @@ import shutil
 import uuid
 from typing import Any, Dict, List, Optional
 
-SECURE_ROOT = os.path.abspath(os.path.join(
+from backend.services.config_service import get_secure_uploads_root
+
+SECURE_ROOT = os.path.join(get_secure_uploads_root(), 'complaints')
+STAGING_ROOT = os.path.join(get_secure_uploads_root(), 'complaint_staging')
+LOCAL_FALLBACK_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..', 'data', 'secure_uploads', 'complaints'
-))
-STAGING_ROOT = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), '..', '..', 'data', 'secure_uploads', 'complaint_staging'
 ))
 
 ALLOWED_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.mp4', '.txt', '.doc', '.docx'}
@@ -186,9 +187,14 @@ def evidence_file_path(complaint_id: str, stored_name: str) -> Optional[str]:
     """Resolve a stored evidence file, refusing any path outside the complaint folder."""
     folder = _complaint_dir(complaint_id)
     path = os.path.abspath(os.path.join(folder, os.path.basename(stored_name)))
-    if not path.startswith(folder + os.sep) or not os.path.isfile(path):
-        return None
-    return path
+    if path.startswith(folder + os.sep) and os.path.isfile(path):
+        return path
+    # Check fallback local directory if moved or during transition
+    fallback_folder = os.path.join(LOCAL_FALLBACK_ROOT, complaint_id)
+    fallback_path = os.path.abspath(os.path.join(fallback_folder, os.path.basename(stored_name)))
+    if fallback_path.startswith(fallback_folder + os.sep) and os.path.isfile(fallback_path):
+        return fallback_path
+    return None
 
 
 def evidence_bytes(complaint_id: str, stored_name: str) -> Optional[bytes]:
