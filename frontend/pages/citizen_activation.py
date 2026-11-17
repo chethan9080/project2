@@ -164,24 +164,31 @@ def citizen_password_reset_request_page() -> None:
                 error_label.text = '⚠ Enter the username, email or mobile on your account.'
                 return
             result = request_password_reset(value)
-            status = result['delivery_status']
+            status = result.get('delivery_status')
             if status == 'SENT':
                 status_label.text = (
-                    'A single-use reset link has been sent to the contact channel on file for that '
-                    f"account. It expires in {token_ttl_hours()} hours."
+                    'If an account matches the provided details, a secure single-use password reset link has been '
+                    f"dispatched to the registered email or mobile number. The link expires in {token_ttl_hours()} hours."
                 )
+                if result.get('test_link'):
+                    status_label.text += f"\n[Dev/Test Mode link]: {result['test_link']}"
+                ui.notify('Password reset request received.', type='positive')
             elif status == 'NOT_CONFIGURED':
                 status_label.text = (
-                    'Your password was not emailed or texted because no delivery provider is configured '
-                    'on this server. Visit the Verification Desk with your registration reference to '
-                    'reset your password.'
+                    'Password reset delivery via email or SMS is currently not configured on this server. '
+                    'To reset your password, please contact the Verification Desk or your local police station '
+                    'with your registration reference.'
                 )
+                ui.notify('Delivery provider not configured.', type='warning')
+            elif status == 'RATE_LIMITED':
+                error_label.text = result.get('detail') or '⚠ Too many requests. Please wait before trying again.'
+                ui.notify('Rate limit reached. Please wait.', type='negative')
             else:
                 status_label.text = (
-                    'The reset link could not be delivered. Please try again shortly or visit the '
-                    'Verification Desk with your registration reference.'
+                    'The password reset request could not be delivered at this time. '
+                    'Please try again shortly or contact the Verification Desk with your registration reference.'
                 )
-            ui.notify('Request received.', type='positive' if status == 'SENT' else 'warning')
+                ui.notify('Delivery attempt failed.', type='warning')
 
         identifier.on('keydown.enter', handle_request)
         ui.button('Send Me a Reset Link', icon='send', on_click=handle_request).props('unelevated').classes(
@@ -190,7 +197,7 @@ def citizen_password_reset_request_page() -> None:
 
         with ui.row().classes('w-full justify-center items-center gap-1 text-[11px] text-slate-500'):
             ui.icon('shield', size='xs').classes('text-slate-400')
-            ui.label('For security this page never shows the link or confirms whether an account exists.')
+            ui.label('For security this page never confirms whether an account exists or transmits existing passwords.')
         with ui.row().classes('w-full justify-center gap-1 text-[11px] text-slate-600'):
             ui.label('Not approved yet?')
             ui.link('Check your registration status', '/citizen/application-status').classes(

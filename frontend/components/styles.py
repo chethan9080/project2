@@ -335,6 +335,11 @@ SCROLL_SYSTEM_HEAD = """
     .flow-grid-cards { --flow-min: 16rem; }
     .flow-grid-wide { --flow-min: 20rem; }
     @media (max-width: 944px) { .hide-compact { display: none !important; } }
+    @media (min-width: 945px) { .show-compact { display: none !important; } }
+    @media (max-width: 944px) { 
+        .show-compact { display: flex !important; }
+        button.show-compact, a.show-compact { display: inline-flex !important; }
+    }
     @media (max-width: 599px) { .hide-tight { display: none !important; } }
 
     /* Phones: the brand and the action cluster each take a full row, so the

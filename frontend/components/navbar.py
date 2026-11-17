@@ -175,6 +175,95 @@ def create_public_header(
                 if show_language_switcher:
                     render_language_switcher()
 
+                # Mobile navigation toggle (hamburger / close button)
+                hamburger_btn = ui.button(
+                    icon='menu',
+                    on_click=lambda: toggle_mobile_menu(),
+                ).props(
+                    'flat round dense color=white aria-label="Toggle navigation menu" aria-expanded=false'
+                ).classes('show-compact text-white shrink-0')
+
+        # Mobile Navigation Drawer / Dropdown (visible only on compact/mobile screens when opened)
+        menu_state = {'open': False}
+        mobile_menu = ui.column().classes(
+            'show-compact w-full max-w-7xl mx-auto py-2.5 px-2 gap-1 border-t border-amber-400/20 bg-slate-900/95 rounded-b-2xl shadow-xl'
+        )
+        mobile_menu.set_visibility(False)
+
+        def toggle_mobile_menu() -> None:
+            menu_state['open'] = not menu_state['open']
+            mobile_menu.set_visibility(menu_state['open'])
+            hamburger_btn.props(f"icon={'close' if menu_state['open'] else 'menu'} aria-expanded={'true' if menu_state['open'] else 'false'}")
+
+        def close_mobile_menu() -> None:
+            menu_state['open'] = False
+            mobile_menu.set_visibility(False)
+            hamburger_btn.props('icon=menu aria-expanded=false')
+
+        with mobile_menu:
+            # 1. Home
+            def _handle_mobile_home() -> None:
+                close_mobile_menu()
+                ui.navigate.to('/')
+
+            ui.button(
+                t('Home'),
+                icon='home',
+                on_click=_handle_mobile_home,
+            ).props('flat no-caps align=left').classes(
+                'w-full text-white/90 hover:text-white hover:bg-white/10 rounded-xl px-3 py-2 text-sm font-semibold'
+            )
+
+            # 2. Sections (How It Works, Portal Services, Access)
+            effective_sections = nav_sections or ['How It Works', 'Portal Services', 'Access']
+            section_icons = ['info', 'apps', 'shield']
+            for idx, sec_title in enumerate(effective_sections):
+                s_icon = section_icons[idx % len(section_icons)]
+                def _build_sec_click(i=idx):
+                    def _click() -> None:
+                        close_mobile_menu()
+                        if nav_sections:
+                            scroll_to_section(i)
+                        else:
+                            ui.navigate.to(f'/?section={i}')
+                    return _click
+
+                ui.button(
+                    t(sec_title),
+                    icon=s_icon,
+                    on_click=_build_sec_click(idx),
+                ).props('flat no-caps align=left').classes(
+                    'w-full text-white/90 hover:text-white hover:bg-white/10 rounded-xl px-3 py-2 text-sm font-semibold'
+                )
+
+            # 3. File FIR Online (Featured CTA)
+            if show_citizen_actions:
+                def _handle_mobile_file_fir() -> None:
+                    close_mobile_menu()
+                    ui.navigate.to('/citizen/submit')
+
+                ui.button(
+                    t('File FIR Online'),
+                    icon='edit_document',
+                    on_click=_handle_mobile_file_fir,
+                ).props('unelevated no-caps align=left').classes(
+                    'w-full bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold rounded-xl px-3 py-2.5 text-sm shadow-md mt-1'
+                )
+
+            # 4. Authorized Staff Link if enabled
+            if show_staff_link and show_citizen_actions:
+                def _handle_mobile_staff() -> None:
+                    close_mobile_menu()
+                    ui.navigate.to('/staff-portal')
+
+                ui.button(
+                    'Authorized Staff →',
+                    icon='admin_panel_settings',
+                    on_click=_handle_mobile_staff,
+                ).props('flat no-caps align=left').classes(
+                    'w-full text-amber-300 hover:text-amber-200 hover:bg-white/10 rounded-xl px-3 py-2 text-xs font-bold'
+                )
+
 
 def create_topbar(title: str = 'Online FIR Portal') -> None:
     """Create top navigation bar for authenticated portal pages."""

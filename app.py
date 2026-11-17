@@ -13,7 +13,11 @@ load_dotenv()
 from nicegui import ui, app as nicegui_app, run
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.exception_handlers import http_exception_handler
+from starlette.requests import Request
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from frontend.i18n import set_language  # ensure i18n is loaded
+from frontend.pages.error_page import handle_404_error
 
 
 from backend.api import api_router
@@ -58,6 +62,17 @@ nicegui_app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
 )
+
+# Custom 404 & HTTP Exception handlers (renders friendly error page without leaking raw traces)
+@nicegui_app.exception_handler(404)
+async def custom_404_status_handler(request: Request, exc: Exception):
+    return await handle_404_error(request, exc)
+
+@nicegui_app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 404:
+        return await handle_404_error(request, exc)
+    return await http_exception_handler(request, exc)
 
 
 def configure_runtime() -> None:

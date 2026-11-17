@@ -240,3 +240,20 @@ def create_home_page() -> None:
         _render_services()
         _render_access()
         _render_footer()
+
+    # If navigated with ?section=X, scroll to that section after render
+    ui.add_body_html("""
+    <script>
+        (() => {
+            const params = new URLSearchParams(window.location.search);
+            const sec = params.get('section');
+            if (sec !== null) {
+                const tryScroll = (attempts) => {
+                    if (window.scrollToSection && window.scrollToSection(parseInt(sec, 10))) return;
+                    if (attempts > 0) setTimeout(() => tryScroll(attempts - 1), 100);
+                };
+                setTimeout(() => tryScroll(10), 200);
+            }
+        })();
+    </script>
+    """)

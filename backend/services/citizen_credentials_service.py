@@ -24,6 +24,7 @@ import re
 import smtplib
 import secrets
 import sqlite3
+import time
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -729,38 +730,210 @@ def complete_activation(raw_token: str, password: str, confirm_password: Optiona
     }
 
 
-def request_password_reset(identifier: str) -> Dict[str, Any]:
-    """Issue a reset link for a verified citizen, without confirming the
-    identifier exists to the caller."""
-    citizen = _find_citizen(identifier)
-    generic = {'requested': True, 'delivery_status': 'NOT_CONFIGURED', 'detail': (
-        'If that account is verified, a password reset link has been issued to the '
-        'registered contact channel.'
-    )}
+_RESET_RATE_LIMITS: Dict[str, List[float]] = {}
+RESET_RATE_LIMIT_WINDOW = 900  # 15 minutes
+RESET_RATE_LIMIT_MAX = 5       # Max 5 attempts per window per identifier
+
+
+def _check_rate_limit(key: str) -> bool:
+    """Sliding-window rate limiter. Returns True if request is allowed."""
+    now = time.time()
+    history = _RESET_RATE_LIMITS.setdefault(key, [])
+    cutoff = now - RESET_RATE_LIMIT_WINDOW
+    _RESET_RATE_LIMITS[key] = [t for t in history if t > cutoff]
+    if len(_RESET_RATE_LIMITS[key]) >= RESET_RATE_LIMIT_MAX:
+        return False
+    _RESET_RATE_LIMITS[key].append(now)
+    return True
+
+
+def password_reset_subject() -> str:
+    return 'Password Reset Request — eKSP Online FIR Portal'
+
+
+def password_reset_body(username: str, link: Optional[str], first_name: str = 'Citizen') -> str:
+    return (
+        f"Dear {first_name or 'Citizen'},\n\n"
+        f"A password reset request was received for your citizen account ({username}).\n\n"
+        f"To reset your password, please open the following secure link:\n"
+        f"{link}\n\n"
+        f"This link is valid for {token_ttl_hours()} hours and can only be used once.\n\n"
+        "If you did not request this password reset, please ignore this message. "
+        "Your account remains secure.\n\n"
+        "Never share this link or your password with anyone. Police personnel and system "
+        "administrators will never ask for your password.\n\n"
+        "Karnataka State Police · e-FIR Portal\n"
+        "Government of Karnataka"
+    )
+
+
+def sms_password_reset_body(username: str, link: Optional[str]) -> str:
+    return f"eKSP: Password reset link for citizen account {username}: {link}. Valid for {token_ttl_hours()}h. Do not share."
+
+
+def deliver_password_reset(citizen_id: str, raw_token: str) -> Dict[str, Any]:
+    """Deliver a dedicated password reset notice over configured providers."""
+    citizen = _load_citizen(citizen_id)
     if not citizen:
-        return generic
+        raise ValueError('Citizen account not found.')
+    credentials = get_credentials(citizen_id)
+    if not credentials:
+        raise ValueError('No credentials have been issued for this citizen.')
+
+    username = credentials['username']
+    link = activation_link(raw_token, PASSWORD_RESET)
+    subject = password_reset_subject()
+    first_name = (citizen.get('name') or 'Citizen').split()[0]
+    body = password_reset_body(username, link, first_name)
+    sms_body = sms_password_reset_body(username, link)
+
+    channels = _channels_for(citizen)
+    from backend.services.config_service import is_test_mode
+    test_mode = is_test_mode()
+
+    if not channels:
+        if test_mode:
+            print(f"[TEST_MODE] Generated password reset link for {username} ({citizen.get('email')}): {link}")
+            return {
+                'delivery_status': SENT,
+                'delivery_channel': 'TEST_MODE',
+                'delivery_detail': f'Test mode: reset link generated for {username}.',
+                'test_link': link,
+            }
+        return {
+            'delivery_status': NOT_CONFIGURED,
+            'delivery_channel': 'NONE',
+            'delivery_detail': (
+                'Password reset delivery via email or SMS is currently not configured on this server '
+                '(SMTP_HOST and SMS_GATEWAY_URL are unset).'
+            ),
+        }
+
+    delivered = None
+    outcomes: List[str] = []
+    for channel, recipient, kind in channels:
+        if not recipient:
+            outcomes.append(f'{channel}: no recipient on file')
+            continue
+        if kind == 'email':
+            status, detail = _dispatch_over_email(recipient, subject, body)
+        else:
+            status, detail = _dispatch_over_sms(recipient, sms_body)
+        outcomes.append(f'{channel}: {status} — {detail}')
+        if status == SENT:
+            delivered = (channel, detail)
+            break
+
+    now_iso = _iso(_now())
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if delivered:
+            channel, detail = delivered
+            cursor.execute(
+                """
+                UPDATE citizen_credentials
+                SET delivery_channel = ?, delivery_status = ?, delivery_detail = ?,
+                    delivery_attempts = delivery_attempts + 1,
+                    delivered_at = ?, updated_at = ?
+                WHERE citizen_id = ?
+                """,
+                (channel, SENT, detail, now_iso, now_iso, citizen_id),
+            )
+            conn.commit()
+            return {
+                'delivery_status': SENT,
+                'delivery_channel': channel,
+                'delivery_detail': detail,
+            }
+
+        detail = 'Delivery attempt failed: ' + '; '.join(outcomes)
+        cursor.execute(
+            """
+            UPDATE citizen_credentials
+            SET delivery_status = ?, delivery_detail = ?,
+                delivery_attempts = delivery_attempts + 1, updated_at = ?
+            WHERE citizen_id = ?
+            """,
+            (FAILED, detail, now_iso, citizen_id),
+        )
+        conn.commit()
+        return {
+            'delivery_status': FAILED,
+            'delivery_channel': 'NONE',
+            'delivery_detail': detail,
+        }
+    finally:
+        conn.close()
+
+
+def request_password_reset(identifier: str) -> Dict[str, Any]:
+    """Issue a reset link for a verified citizen with rate limiting and anti-enumeration.
+
+    The response does not reveal whether the account exists to prevent user enumeration.
+    """
+    clean_id = (identifier or '').strip().lower()
+    if not clean_id:
+        return {'requested': False, 'delivery_status': 'INVALID', 'detail': 'Enter your username, email or mobile.'}
+
+    if not _check_rate_limit(clean_id):
+        return {
+            'requested': False,
+            'delivery_status': 'RATE_LIMITED',
+            'detail': 'Too many password reset requests. Please wait 15 minutes before trying again.',
+        }
+
+    has_provider = bool(_env('SMTP_HOST') or (_env('SMS_GATEWAY_URL') and _env('SMS_GATEWAY_API_KEY')))
+    from backend.services.config_service import is_test_mode
+    test_mode = is_test_mode()
+
+    if not has_provider and not test_mode:
+        return {
+            'requested': True,
+            'delivery_status': NOT_CONFIGURED,
+            'detail': (
+                'Password reset delivery via email or SMS is currently not configured on this server. '
+                'To reset your password, please contact the Verification Desk or your local police station '
+                'with your registration reference.'
+            ),
+        }
+
+    generic_sent = {
+        'requested': True,
+        'delivery_status': SENT,
+        'detail': (
+            'If an account matches the provided details, a secure password reset link has been dispatched '
+            'to the registered email or mobile number.'
+        ),
+    }
+
+    citizen = _find_citizen(identifier)
+    if not citizen:
+        return generic_sent
 
     credentials = get_credentials(citizen['id'])
     if not credentials:
-        return generic
+        return generic_sent
 
     raw_token = mint_token(citizen['id'], PASSWORD_RESET, issued_by='SELF_SERVICE')
     try:
         delivery = deliver_password_reset(citizen['id'], raw_token)
+        if delivery['delivery_status'] == SENT:
+            res = dict(generic_sent)
+            if test_mode and delivery.get('test_link'):
+                res['test_link'] = delivery['test_link']
+            return res
+        return {
+            'requested': True,
+            'delivery_status': delivery['delivery_status'],
+            'detail': 'Delivery attempt failed. Please try again shortly or contact the Verification Desk.',
+        }
     except Exception as error:
-        return {'requested': True, 'delivery_status': FAILED, 'detail': str(error)}
-    return {
-        'requested': True,
-        'delivery_status': delivery['delivery_status'],
-        'channel': delivery.get('delivery_channel'),
-        'detail': delivery['delivery_detail'],
-        'username_shown': citizen.get('username'),
-    }
-
-
-def deliver_password_reset(citizen_id: str, raw_token: str) -> Dict[str, Any]:
-    """Reset links go out over the same providers, tracked on the credentials row."""
-    return deliver_credentials(citizen_id, activation_link(raw_token, PASSWORD_RESET))
+        return {
+            'requested': True,
+            'delivery_status': FAILED,
+            'detail': 'An error occurred while processing your request. Please try again later.',
+        }
 
 
 def complete_password_reset(raw_token: str, password: str, confirm_password: Optional[str] = None) -> Dict[str, Any]:
